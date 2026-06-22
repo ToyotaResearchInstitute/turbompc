@@ -1,0 +1,46 @@
+exclude: .devcontainer/
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+    - id: trailing-whitespace
+    - id: end-of-file-fixer
+    - id: check-yaml
+    - id: name-tests-test
+      args: ['--pytest-test-first']
+      exclude: ^tests/(helpers|cuda/helpers)/
+    - id: requirements-txt-fixer
+    - id: check-json
+  - repo: https://github.com/psf/black
+    rev: 23.1.0
+    hooks:
+    - id: black
+      args: ["--preview"]
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+    - id: isort
+      args: ["--profile", "black", "--filter-files",  "--known-local-folder", "app"]
+  - repo: https://github.com/PyCQA/flake8
+    rev: 6.1.0
+    hooks:
+    - id: flake8
+      args: [
+          "--ignore", "E203,E266,E501,W503,F403,F401,F841,E402,",
+          "--max-line-length", "88",
+          "--max-complexity", "18",
+          "--select", "B,C,E,F,W,T4,B9",
+          "--per-file-ignores",
+          "turbompc/solvers/qp_data.py:E741 turbompc/solvers/turbompc_solver.py:E741, turbompc/solvers/sqp_osqp.py:E741 turbompc/problems/optimal_control_problem.py:E741 tests/python/solvers/test_solver_sqp_osqp.py:E741 tests/python/solvers/test_admm_residuals.py:E741 tests/cuda/solvers/test_turbompc_solver_backends.py:E741,benchmarking/linear-system/benchmark_mpcpytorch_constrained.py:F821,benchmarking/linear-system/benchmark_mpcpytorch_constrained.py:C901",
+      ]
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: 'v0.1.8'
+    hooks:
+      - id: ruff
+        args: [
+          "--fix",
+          "--ignore", "E402",
+          "--per-file-ignores",
+          "turbompc/solvers/qp_data.py:E741,turbompc/solvers/turbompc_solver.py:E741,turbompc/solvers/sqp_osqp.py:E741,turbompc/problems/optimal_control_problem.py:E741,tests/python/solvers/test_solver_sqp_osqp.py:E741,tests/python/solvers/test_admm_residuals.py:E741,tests/cuda/solvers/test_turbompc_solver_backends.py:E741,benchmarking/linear-system/benchmark_mpcpytorch_constrained.py:F821",
+        ]

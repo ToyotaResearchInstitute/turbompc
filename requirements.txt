@@ -1,0 +1,12 @@
+jax
+jaxlib
+matplotlib
+numpy>=1.17.4
+osqp==0.6.7.post3
+pytest
+pyyaml
+scipy
+
+# Optional: CUDA FFI backends (pcg_ffi, cudss_ffi, fused_pcg, fused_cudss)
+# Requires: cmake >= 3.20, CUDA Toolkit >= 12.0
+# cuDSS (optional): https://developer.nvidia.com/cudss

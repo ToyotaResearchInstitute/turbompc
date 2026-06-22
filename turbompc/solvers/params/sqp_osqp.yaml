@@ -1,0 +1,16 @@
+verbose: False
+tol_convergence: 1.E-6
+num_sqp_iteration_max: 15
+linesearch: False
+linesearch_eta: 0.4
+linesearch_alphas: [0.01, 0.1, 0.3, 0.7, 1.0]
+osqp:
+  eps_abs: 1.E-9
+  eps_rel: 1.E-9
+  max_iter: 10000
+  check_termination_every: 25
+  polish: false
+  warm_start: true
+  scaling: 0
+  verbose: False
+  relaxation_parameter: 1.6 # in (1, 2)

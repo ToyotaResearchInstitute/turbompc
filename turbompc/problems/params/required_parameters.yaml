@@ -1,0 +1,41 @@
+# dynamics (horizon, discretization_resolution, scheme)
+horizon: 0
+discretization_resolution: 0.1 # dt
+# see optimal_control_problem.py for convention:
+# 0 (euler), 1 (midpoint), 2 (rk4), 10 (implicit trapezoidal)
+discretization_scheme: 0
+
+# initial state, initial-guess target, and initial control
+initial_state: [0., 0.]
+initial_guess_final_state: [0., 0.]
+constrain_initial_control: False
+initial_control: [0., 0.]
+
+# reference trajectories
+reference_state_trajectory: [0., 0.] # (horizon+1, nx) - later duplicated over time
+reference_control_trajectory: [0., 0.] # (horizon+1, nx) - later duplicated over time
+
+# cost parameters
+penalize_control_reference: False
+weights_penalization_reference_state_trajectory: [0., 0.]
+weights_penalization_final_state: [0., 0.]
+weights_penalization_control_squared: [0., 0.]
+weights_penalization_control_rate: [0., 0.]
+
+# state and control bounds
+# (not required)
+
+# slack variables on inequality constraints
+# (not necessarily needed if not using slack variables problem class)
+# use_slack_variables: False
+# slack_penalization_weight: 0.0
+
+# rescaling
+rescale_optimization_variables: False
+state_rescaling_min: [0., 0.]
+state_rescaling_max: [1., 1.]
+control_rescaling_min: [0., 0.]
+control_rescaling_max: [1., 1.]
+
+# dynamics parameters
+dynamics_state_dot_params: {}

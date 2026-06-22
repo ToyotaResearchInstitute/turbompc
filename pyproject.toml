@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turbompc"
+version = "1.0.0"
+description = "TurboMPC: Fast, Scalable, and Differentiable Model Predictive Control on the GPU"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    {name = "TurboMPC team", email = "thomas.lew@tri.global"},
+]
+dependencies = [
+    "jax>=0.4.20",
+    "jaxlib>=0.4.20",
+    "numpy>=1.17.4",
+    "osqp==0.6.7.post3",
+    "scipy",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "matplotlib",
+]
+
+[tool.setuptools.packages.find]
+include = ["turbompc*"]
+
+[tool.pytest.ini_options]
+testpaths = [
+    "tests",
+]
+markers = [
+    "extended: broad, stress, or diagnosis tests skipped by default",
+]

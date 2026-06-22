@@ -1,0 +1,23 @@
+verbose: False
+tol_convergence: 1.E-6
+convergence_criterion: first_order
+num_sqp_iteration_max: 15
+linesearch: False
+linesearch_eta: 0.4
+linesearch_alphas: [0.1, 0.3, 0.7, 1.0]
+admm:
+  rho: 0.1
+  sigma: 1.0e-6
+  max_iter: 100
+  eps_abs: 1.E-9
+  eps_rel: 1.E-9
+  rho_min: 1.0e-6
+  rho_max: 1.0e6
+  check_termination_every: 25
+  adapt_rho_every: 25
+  adaptive_rho_tolerance: 5
+  relaxation_parameter: 1.6 # in (1, 2)
+  rho_f_factor: 1000.
+  pcg:
+    max_iter: 10000
+    tol_epsilon: 1.0e-20

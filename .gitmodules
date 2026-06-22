@@ -1,0 +1,3 @@
+[submodule "benchmarking/mpc.pytorch"]
+	path = benchmarking/mpc.pytorch
+	url = https://github.com/diffmpc/mpc.pytorch.git

@@ -1,0 +1,50 @@
+# State: (px, py, pz, vx, vy, vz)
+# Control: (ux, uy, uz)
+
+# dynamics (horizon, discretization_resolution, scheme)
+horizon: 50
+discretization_resolution: 1.0 # dt
+# see optimal_control_problem.py for convention:
+# 0 (euler), 10 (implicit)
+discretization_scheme: 10
+
+# initial state, initial-guess target, and initial control
+initial_state: [-1.9, 0.05, 0.2, 0, 0, 0]
+initial_guess_final_state: [0., 0., 0., 0., 0., 0.]
+constrain_initial_control: True
+initial_control: [0., 0., 0.]
+
+# reference trajectories
+reference_state_trajectory: [0., 0., 0., 0., 0., 0.]
+reference_control_trajectory: [0., 0., 0.]
+
+# cost parameters
+penalize_control_reference: False
+weights_penalization_reference_state_trajectory: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+weights_penalization_final_state: [1., 1., 1., 1., 1., 1.]
+weights_penalization_control_squared: [1., 1., 1.]
+weights_penalization_control_rate: [1.E-2, 1.E-2, 1.E-2]
+weights_linear_penalization_final_state: [0., 0., 0., 0., 0., 0.]
+
+# state and control bounds
+state_min_bounds: [-1.E+7, -1.E+7, -1.E+7, -1.E+7, -1.E+7, -1.E+7]
+state_max_bounds: [1.E+7, 1.E+7, 1.E+7, 1.E+7, 1.E+7, 1.E+7]
+control_min_bounds: [-10., -10., -10.]
+control_max_bounds: [10., 10., 10.]
+
+# slack variables on inequality constraints
+use_slack_variables: False
+slack_penalization_weight: 0.0
+
+# rescaling
+rescale_optimization_variables: True
+state_rescaling_min: [-1., -1, -1, -1., -1, -1]
+state_rescaling_max: [1., 1., 1., 1., 1., 1.]
+control_rescaling_min: [-1., -1, -1]
+control_rescaling_max: [1., 1., 1.]
+
+# dictionary of parameters for the state_dot function of the dynamics
+# (key=string, value=jnp.array((horizon, parameter_size)))
+# where each key is an argument of the function state_dot of the dynamics
+dynamics_state_dot_params: null
+# nominal_dynamics_state_dot_params: null
