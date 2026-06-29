@@ -562,6 +562,9 @@ class TurboMPCSolver:
             qp_data = self._augment_D_with_dynamics_hessian(
                 qp_data, forward_solution, problem_params
             )
+            qp_data = self._augment_D_with_inequality_hessian(
+                qp_data, forward_solution, problem_params
+            )
 
         eq = qp_data.eq
         eq = QPEqualityBlocks(
@@ -1343,6 +1346,34 @@ class TurboMPCSolver:
         # The backward QP uses unscaled primal variables (`apply_variable_scaling=False`),
         # so the dynamics Hessian in true coordinates is added directly here.
         D_augmented = qp_data.cost.D + dynamics_hessian
+        return QPData(
+            cost=QPCostBlocks(D=D_augmented, E=qp_data.cost.E, q=qp_data.cost.q),
+            eq=qp_data.eq,
+            ineq=qp_data.ineq,
+        )
+
+    def _augment_D_with_inequality_hessian(
+        self,
+        qp_data,
+        forward_solution,
+        problem_params,
+    ):
+        """Add sum_i mu_i nabla^2 g_i to D blocks for the exact Lagrangian Hessian backward.
+        """
+        if qp_data.ineq.G.shape[1] == 0:
+            return qp_data
+        kkt_state = forward_solution.kkt_state
+        if forward_solution.admm_state is not None:
+            mus = forward_solution.admm_state.y_g  # (N+1, m), raw
+        else:
+            mus = kkt_state.y_ineq  # (N+1, m), raw
+
+        inequality_hessian = self.program.get_inequality_lagrangian_hessian(
+            kkt_state.states, kkt_state.controls, problem_params, mus
+        )
+
+        # Backward QP uses unscaled primal variables, so add in true coordinates.
+        D_augmented = qp_data.cost.D + inequality_hessian
         return QPData(
             cost=QPCostBlocks(D=D_augmented, E=qp_data.cost.E, q=qp_data.cost.q),
             eq=qp_data.eq,
