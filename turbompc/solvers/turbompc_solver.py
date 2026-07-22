@@ -887,6 +887,7 @@ class TurboMPCSolver:
     def _forward_multipliers(
         self, forward_solution: TurboMPCSolution
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+
         kkt_state = forward_solution.kkt_state
         sign = kkt_state.ineq_active_lower_idx.astype(kkt_state.y_ineq.dtype) - kkt_state.ineq_active_upper_idx.astype(kkt_state.y_ineq.dtype)
         if forward_solution.admm_state is not None:
@@ -1364,9 +1365,12 @@ class TurboMPCSolver:
             return qp_data
         kkt_state = forward_solution.kkt_state
         if forward_solution.admm_state is not None:
-            mus = forward_solution.admm_state.y_g  # (N+1, m), raw
+            y_g = forward_solution.admm_state.y_g  # (N+1, m) net two-sided dual ν_u - ν_l
         else:
-            mus = kkt_state.y_ineq  # (N+1, m), raw
+            y_g = kkt_state.y_ineq
+
+        active = (kkt_state.ineq_active_lower_idx | kkt_state.ineq_active_upper_idx).astype(y_g.dtype)
+        mus = active * y_g  # (N+1, m)
 
         inequality_hessian = self.program.get_inequality_lagrangian_hessian(
             kkt_state.states, kkt_state.controls, problem_params, mus

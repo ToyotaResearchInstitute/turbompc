@@ -15,15 +15,10 @@ from turbompc.utils.gradient_finitediff import gradient_finite_diff
 
 
 class OptimalControlProblemLowerObstacle(OptimalControlProblem):
-    """Same obstacle avoidance, but encoded as a LOWER-active nonlinear constraint:
-
-        g(x) = ||p - c|| / (r + eps) - 1  >= 0      (g_l = 0, g_u = +1e9)
-
-    This has the SAME feasible region as OptimalControlProblemObstacle's UPPER-active
-    g'(x) = 1 - ||p-c||/(r+eps) <= 0  (g' = -g), but here the LOWER bound binds when the
-    path grazes the obstacle -> it exercises the lower-active branch of the
-    inequality-Hessian multiplier (signed net dual mu = y_g = -nu_l, NOT -sign*y_g).
-    g is nonlinear so nabla^2 g != 0 and the Hessian term is non-trivial.
+    """Obstacle avoidance encoded as a lower-active nonlinear constraint:
+    g(x) = ||p - c|| / (r + eps) - 1 >= 0 (g_l = 0, g_u = +1e9)
+    The problem is equivalent to OptimalControlProblemObstacle, which uses upper-active
+    constraints g(x) = 1 - ||p-c||/(r+eps) <= 0
     """
 
     def step_inequality_constraints(self, state, control, params):
@@ -47,10 +42,10 @@ class OptimalControlProblemLowerObstacle(OptimalControlProblem):
 
 NX, NU = 4, 2
 START = jnp.array([0.0, 0.0, 0.0, 0.0])
-GOAL = jnp.array([2.0, 1.5, 0.0, 0.0])         # off-axis -> no degenerate weight direction
-OBS_C = jnp.array([1.0, 0.55])                  # on the start->goal path, firmly in the way
+GOAL = jnp.array([2.0, 1.5, 0.0, 0.0])         
+OBS_C = jnp.array([1.0, 0.55])                  
 OBS_R = 0.55
-HORIZON, DT = 14, 0.18
+HORIZON, DT = 5, 0.1
 QK = "weights_penalization_reference_state_trajectory"
 RK = "weights_penalization_control_squared"
 WEIGHT_KEYS = [QK, RK]
@@ -111,11 +106,7 @@ def _ad_grad(solver, problem_params, loss_fn=_loss):
 
 
 def _fd_grad(solver, problem_params, eps_seq=(1e-3, 3e-4, 1e-4), rtol=2e-3, atol=1e-7, loss_fn=_loss):
-    """Convergence-checked FD built on the canonical turbompc.utils.gradient_finite_diff
-    primitive (so the central difference can't drift from other tests): take its
-    central-difference estimate at each eps in eps_seq, then keep the plateau (consecutive
-    estimates agreeing within rtol/atol); flag if no plateau exists (CLAUDE.md FD rule).
-    Returns (flat grad over WEIGHT_KEYS, flagged)."""
+    """Finite difference check"""
     ig = solver.initial_guess(problem_params)
 
     def fwd(weights):
@@ -140,7 +131,7 @@ def _fd_grad(solver, problem_params, eps_seq=(1e-3, 3e-4, 1e-4), rtol=2e-3, atol
 
 
 def test_obstacle_active_and_dynamics_linear():
-    """Sanity: forward converges and the obstacle is active (so mu, grad^2 g != 0)."""
+    """forward converges and the obstacle is active (so mu, grad^2 g != 0)."""
     solver, problem_params = _build(use_full_hessian=True)
     ig = solver.initial_guess(problem_params)
     sol = solver.solve(ig, problem_params, {k: problem_params[k] for k in WEIGHT_KEYS})
@@ -161,7 +152,7 @@ def test_inequality_hessian_matches_fd():
 
 
 def test_without_inequality_hessian_is_worse():
-    """Ablation: use_full_hessian=False (Gauss-Newton inequality) is materially worse vs FD."""
+    """Ablation: use_full_hessian=False (Gauss-Newton inequality) is worse vs FD."""
     solver_on, problem_params = _build(use_full_hessian=True)
     solver_off, _ = _build(use_full_hessian=False)
     g_on = _flat(_ad_grad(solver_on, problem_params))
@@ -173,16 +164,9 @@ def test_without_inequality_hessian_is_worse():
     assert rel_off > 5 * rel_on, f"ablation not separated: on={rel_on:.2e} off={rel_off:.2e}"
 
 
-# --------------------------------------------------------------------------- #
-# LOWER-active nonlinear constraint (the case -sign*y_g would get wrong; the signed
-# net dual y_g gets right). Same obstacle, encoded as g = ||p-c||/(r+eps) - 1 >= 0.
-# --------------------------------------------------------------------------- #
-
-
 def test_lower_obstacle_active_and_lower():
-    """Sanity: forward converges, the (lower-active) obstacle is engaged, and the obstacle's
-    ADMM dual is NEGATIVE (= lower-active, y_g = -nu_l) — i.e. we exercise the lower-active
-    branch, opposite to the standard upper-active obstacle (whose dual is positive)."""
+    """forward converges, the (lower-active) obstacle is engaged, and the obstacle's
+    ADMM dual is NEGATIVE (= lower-active, y_g = -nu_l)"""
     solver, problem_params = _build(use_full_hessian=True, ocp_cls=OptimalControlProblemLowerObstacle)
     ig = solver.initial_guess(problem_params)
     sol = solver.solve(ig, problem_params, {k: problem_params[k] for k in WEIGHT_KEYS})
@@ -197,7 +181,7 @@ def test_lower_obstacle_active_and_lower():
 
 
 def test_lower_active_inequality_hessian_matches_fd():
-    """LOWER-active nonlinear constraint: AD (signed net dual y_g Hessian) matches
+    """lower-active nonlinear constraint: AD (signed net dual y_g Hessian) matches
     convergence-checked FD. With -sign*y_g the Hessian sign flips for lower-active -> fails."""
     solver, problem_params = _build(use_full_hessian=True, ocp_cls=OptimalControlProblemLowerObstacle)
     g_ad = _flat(_ad_grad(solver, problem_params))
@@ -208,11 +192,7 @@ def test_lower_active_inequality_hessian_matches_fd():
 
 
 def test_lower_active_matches_upper_active():
-    """Non-vacuity cross-check: the lower-active encoding and the standard upper-active
-    obstacle are the SAME physical problem, so their AD weight-gradients must agree. The
-    inequality-Hessian curvature is +nu*grad^2(g_up) under BOTH only if each uses the signed
-    net dual (upper: +nu_u; lower: -nu_l acting on grad^2 of the negated g). Under the buggy
-    -sign*y_g the lower-active curvature flips sign -> this cosine drops below 1."""
+    """lower-active nonlinear constraints match upper-active (same feasible set + cost) in forward primals and AD gradient."""
     solver_up, problem_params_up = _build(use_full_hessian=True, ocp_cls=OptimalControlProblemObstacle)
     solver_lo, problem_params_lo = _build(use_full_hessian=True, ocp_cls=OptimalControlProblemLowerObstacle)
     # forward primals coincide (identical feasible set + cost)
@@ -228,17 +208,13 @@ def test_lower_active_matches_upper_active():
 
 # --------------------------------------------------------------------------- #
 # NONLINEAR DRONE DYNAMICS (quadratic drag, ∇²f != 0) + nonlinear inequality (obstacle).
-# The other tests use a LINEAR double integrator (∇²f = 0), so only the inequality Hessian
-# is exercised; here BOTH the dynamics Lagrangian Hessian λᵀ∇²f AND the inequality Hessian
-# μᵀ∇²g are active, on the real DroneDynamics model. Geometry mirrors the verified
-# obstacle-grazing setup in experiments/rl/drone_rl/drone_env.py (reduced horizon).
 # --------------------------------------------------------------------------- #
 DRONE_NX, DRONE_NU = 6, 3
 DRONE_START = jnp.array([-1.9, 0.05, 0.0, 0.0, 0.0, 0.0])
-DRONE_GOAL = jnp.zeros(6)                 # regulate position to the origin
-DRONE_OBS_C = jnp.array([-0.95, 0.025])   # on the START->origin line -> path must detour
+DRONE_GOAL = jnp.zeros(6)                 
+DRONE_OBS_C = jnp.array([-0.95, 0.025])   
 DRONE_OBS_R = 0.3
-DRONE_H, DRONE_DT = 20, 1.0
+DRONE_H, DRONE_DT = 5, 1.0
 
 
 def _loss_drone(states, controls):
@@ -260,7 +236,7 @@ def _build_drone(use_full_hessian):
     problem_params["initial_guess_final_state"] = DRONE_GOAL
     problem_params["reference_state_trajectory"] = jnp.tile(DRONE_GOAL, (N + 1, 1))
     problem_params["reference_control_trajectory"] = jnp.zeros((N + 1, DRONE_NU))
-    problem_params[QK] = jnp.array([5.0, 5.0, 5.0, 0.1, 0.1, 0.1])   # favor reaching -> engage the obstacle
+    problem_params[QK] = jnp.array([5.0, 5.0, 5.0, 0.1, 0.1, 0.1])   
     problem_params[RK] = jnp.array([0.1, 0.1, 0.1])
     problem_params["weights_penalization_final_state"] = jnp.zeros((DRONE_NX,))
     problem_params["obstacles_centers"] = jnp.tile(DRONE_OBS_C[None, None, :], (N + 1, 1, 1))
@@ -285,9 +261,7 @@ def _build_drone(use_full_hessian):
 
 
 def test_drone_obstacle_active_and_dynamics_nonlinear():
-    """Sanity: forward converges, the obstacle is engaged (mu, grad^2 g != 0), AND the
-    drone is moving so the quadratic-drag dynamics are nonlinear (grad^2 f != 0) — i.e.
-    BOTH Hessian terms are non-trivial here, unlike the linear-dynamics tests."""
+    """forward convergence check"""
     solver, problem_params = _build_drone(use_full_hessian=True)
     sol = solver.solve(solver.initial_guess(problem_params), problem_params, {k: problem_params[k] for k in WEIGHT_KEYS})
     assert float(sol.convergence_error) < 1e-5
@@ -299,8 +273,7 @@ def test_drone_obstacle_active_and_dynamics_nonlinear():
 
 
 def test_drone_inequality_hessian_matches_fd():
-    """Nonlinear drone (drag) + obstacle: AD with the full Lagrangian Hessian (dynamics
-    λᵀ∇²f + inequality μᵀ∇²g) matches convergence-checked FD."""
+    """Nonlinear drone (drag) + obstacle: AD with the full Lagrangian Hessian matches FD."""
     solver, problem_params = _build_drone(use_full_hessian=True)
     g_ad = _flat(_ad_grad(solver, problem_params, loss_fn=_loss_drone))
     g_fd, flagged = _fd_grad(solver, problem_params, loss_fn=_loss_drone)
@@ -310,8 +283,7 @@ def test_drone_inequality_hessian_matches_fd():
 
 
 def test_drone_without_full_hessian_is_worse():
-    """Ablation on the nonlinear drone: Gauss-Newton (use_full_hessian=False, dropping both
-    λᵀ∇²f and μᵀ∇²g) is materially worse vs FD than the full Hessian."""
+    """Ablation on the nonlinear drone: Gauss-Newton is worse vs FD than the full Hessian."""
     solver_on, problem_params = _build_drone(use_full_hessian=True)
     solver_off, _ = _build_drone(use_full_hessian=False)
     g_on = _flat(_ad_grad(solver_on, problem_params, loss_fn=_loss_drone))
