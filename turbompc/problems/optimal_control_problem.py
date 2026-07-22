@@ -1441,44 +1441,6 @@ class OptimalControlProblem(BaseOptimalControlProblem):
 
         return hess_blocks
 
-    def get_inequality_lagrangian_hessian(
-        self,
-        states: jnp.ndarray,
-        controls: jnp.ndarray,
-        params: Dict[str, Any],
-        mus: jnp.ndarray,
-    ) -> jnp.ndarray:
-        """Compute inequality-constraint Lagrangian Hessian.
-        Args:
-            states: (N+1, nx) array.
-            controls: (N+1, nu) array.
-            params: problem params (per-stage inequality params sliced internally).
-            mus: (N+1, m) per-row inequality multiplier (net two-sided ν_u - ν_l), in
-                the SAME row order/space as ``step_inequality_constraints`` returns g.
-
-        Returns:
-            (N+1, n, n) array of Hessian blocks to add to D (n = nx + nu).
-        """
-        nx = self.num_state_variables
-        pointwise_params, params_in_axes = self._prepare_pointwise_inequality_params(
-            params
-        )
-
-        def single_hessian(x, u, mu, step_params):
-            """Hessian of μᵀ g(x, u) = Σ_i μ_i g_i(x, u) for one stage."""
-
-            def scalar_fn(xu):
-                g, _, _ = self.step_inequality_constraints(
-                    xu[:nx], xu[nx:], step_params
-                )
-                return mu @ g
-
-            return jax.hessian(scalar_fn)(jnp.concatenate([x, u]))
-
-        return jax.vmap(single_hessian, in_axes=(0, 0, 0, params_in_axes))(
-            states, controls, mus, pointwise_params
-        )
-
 
 class SlackProblemAdapter:
     """Adapter that augments a problem to support slack variables.
