@@ -272,18 +272,8 @@ def test_drone_obstacle_active_and_dynamics_nonlinear():
     assert speed.max() > 1e-2, f"drone not moving -> drag (nonlinear dyn) inactive (vmax {speed.max():.2e})"
 
 
-def test_drone_inequality_hessian_matches_fd():
-    """Nonlinear drone (drag) + obstacle: AD with the full Lagrangian Hessian matches FD."""
-    solver, problem_params = _build_drone(use_full_hessian=True)
-    g_ad = _flat(_ad_grad(solver, problem_params, loss_fn=_loss_drone))
-    g_fd, flagged = _fd_grad(solver, problem_params, loss_fn=_loss_drone)
-    assert not flagged, "FD did not plateau"
-    assert _cos(g_ad, g_fd) > 1 - 1e-4, f"drone AD vs FD cos={_cos(g_ad, g_fd)}"
-    assert _rel(g_ad, g_fd) < 5e-3, f"drone AD vs FD rel_l2={_rel(g_ad, g_fd)}"
-
-
 def test_drone_without_full_hessian_is_worse():
-    """Ablation on the nonlinear drone: Gauss-Newton is worse vs FD than the full Hessian."""
+    """Check full Hessian with finite difference and ablation on the nonlinear drone: Gauss-Newton is worse vs FD than the full Hessian."""
     solver_on, problem_params = _build_drone(use_full_hessian=True)
     solver_off, _ = _build_drone(use_full_hessian=False)
     g_on = _flat(_ad_grad(solver_on, problem_params, loss_fn=_loss_drone))
@@ -291,5 +281,7 @@ def test_drone_without_full_hessian_is_worse():
     g_fd, flagged = _fd_grad(solver_on, problem_params, loss_fn=_loss_drone)
     assert not flagged
     rel_on, rel_off = _rel(g_on, g_fd), _rel(g_off, g_fd)
+    # Compare with finite differences.
     assert rel_on < 5e-3, f"with-Hessian rel_l2={rel_on}"
+    # With Hessian gives more accurate gradient.
     assert rel_off > 3 * rel_on, f"ablation not separated: on={rel_on:.2e} off={rel_off:.2e}"
