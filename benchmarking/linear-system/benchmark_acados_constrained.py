@@ -81,16 +81,16 @@ def create_acados_solver(
 
     ocp = AcadosOcp()
     model: AcadosModel = ocp.model
-    model.x = ca.SX.sym("x", nx)
-    model.u = ca.SX.sym("u", nu)
+    model.x = ca.MX.sym("x", nx)
+    model.u = ca.MX.sym("u", nu)
     model.name = f"linear_mpc_bench_{seed}"
 
     ocp.solver_options.integrator_type = "DISCRETE"
     model.disc_dyn_expr = problem.dynamics.A @ model.x + problem.dynamics.B @ model.u + problem.dynamics.b
 
     # parameters
-    p_Q_diag = ca.SX.sym("p_Q_diag", nx)
-    p_R_diag = ca.SX.sym("p_Q_diag", nu)
+    p_Q_diag = ca.MX.sym("p_Q_diag", nx)
+    p_R_diag = ca.MX.sym("p_Q_diag", nu)
     ocp.model.p_global = ca.vertcat(*[ocp.model.p_global, p_Q_diag, p_R_diag])
     ocp.p_global_values = np.concatenate(
         (ocp.p_global_values, np.diag(problem.cost.Q), np.diag(problem.cost.R))
