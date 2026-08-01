@@ -297,7 +297,8 @@ def benchmark_acados_rollout(
                 solver.setup_qp_matrices_and_factorize(n_batch)
                 for j in range(n_batch):
                     result = solver.ocp_solvers[j].eval_solution_sensitivity(
-                        stages=0, with_respect_to="initial_state"
+                        stages=0, with_respect_to="initial_state",
+                        sanity_checks=False
                     )
                     K_step[j] = result["sens_u"]
 
