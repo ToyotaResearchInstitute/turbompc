@@ -30,12 +30,10 @@ class LinearDiscreteDynamics:
 
 @dataclass
 class QuadraticCost:
-    """Quadratic cost 0.5 x^T Q x + 0.5 u^T R u + x^T r + u^T q."""
+    """Quadratic cost 0.5 x^T Q x + 0.5 u^T R u"""
 
     Q: np.ndarray
     R: np.ndarray
-    r: np.ndarray
-    q: np.ndarray
 
 
 @dataclass
@@ -177,7 +175,7 @@ def benchmark_acados_rollout(
         )
 
         # Problem object
-        quadratic_cost = QuadraticCost(Q, R, np.zeros(nx), np.zeros(nu))
+        quadratic_cost = QuadraticCost(Q, R)
         dynamics = LinearDiscreteDynamics(A_base, B_base, b_base)
         u_lower = -umax * np.ones((nu,), dtype=np.float64)
         u_upper = umax * np.ones((nu,), dtype=np.float64)
