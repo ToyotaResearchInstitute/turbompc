@@ -115,7 +115,7 @@ def create_acados_solver(
     ocp.solver_options.with_batch_functionality = True
 
     if compute_gradient:
-        ocp.code_gen_options.with_solution_sens_wrt_params = True
+        ocp.code_gen_options.with_solution_sens_wrt_params_adj = True
         ocp.solver_options.hessian_approx = "EXACT"
         ocp.solver_options.qp_solver_cond_ric_alg = 0
         ocp.solver_options.qp_solver_ric_alg = (
