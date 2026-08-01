@@ -88,18 +88,20 @@ def create_acados_solver(
     ocp.solver_options.integrator_type = "DISCRETE"
     model.disc_dyn_expr = problem.dynamics.A @ model.x + problem.dynamics.B @ model.u + problem.dynamics.b
 
+    # parameters
+    p_Q_diag = ca.SX.sym("p_Q_diag", nx)
+    p_R_diag = ca.SX.sym("p_Q_diag", nu)
+    ocp.model.p_global = ca.vertcat(*[ocp.model.p_global, p_Q_diag, p_R_diag])
+    ocp.p_global_values = np.concatenate(
+        (ocp.p_global_values, np.diag(problem.cost.Q), np.diag(problem.cost.R))
+    )
+
     # Cost
     ocp.cost.cost_type = "EXTERNAL"
     ocp.cost.cost_type_e = "EXTERNAL"
-    H_mat = ca.SX.sym("H", nx + nu, nx + nu)
     xu = ca.vertcat(model.x, model.u)
-    ocp.model.cost_expr_ext_cost = ca.mtimes([xu.T, H_mat, xu])
-    ocp.model.cost_expr_ext_cost_e = ca.mtimes([model.x.T, H_mat[:nx, :nx], model.x])
-    ocp.model.p_global = ca.vertcat(*[ocp.model.p_global, H_mat.reshape((-1, 1))])
-    H_mat_val = scipy.linalg.block_diag(problem.cost.Q, problem.cost.R)
-    ocp.p_global_values = np.concatenate(
-        (ocp.p_global_values, H_mat_val.flatten(order="F"))
-    )
+    ocp.model.cost_expr_ext_cost = ca.mtimes([xu.T, ca.diag(ca.vertcat(p_Q_diag, p_R_diag)), xu])
+    ocp.model.cost_expr_ext_cost_e = ca.mtimes([model.x.T, ca.diag(p_Q_diag), model.x])
 
     # Constraints
     ocp.constraints.lbu = problem.control_bounds.u_lower
@@ -198,8 +200,8 @@ def benchmark_acados_rollout(
         )
 
         def build_p_global(Q_mat: np.ndarray, R_mat: np.ndarray) -> np.ndarray:
-            H_mat_val = scipy.linalg.block_diag(Q_mat, R_mat)
-            return H_mat_val.flatten(order="F")
+            p_global_val = np.concatenate([np.diag(Q_mat), np.diag(R_mat)])
+            return p_global_val
 
         def prepare_batch_step(
             current_states: np.ndarray, p_global_values: np.ndarray
@@ -264,17 +266,6 @@ def benchmark_acados_rollout(
         all_times_fwd.append(total_time)
         all_costs.append(final_cost)
 
-        # Gradient computation
-        # p_global layout: [ H.flat(F)]  ((nx+nu)^2)
-        # H = block_diag(Q, R), so diag(H)[: nx] = diag(Q), diag(H)[nx:] = diag(R).
-        # From the flat Fortran-order H vector, the k-th diagonal entry is at index k*(nx+nu+1).
-        nxnu = problem.nx + problem.nu
-        # Indices in p_global for diag(Q) and diag(R)
-        Q_diag_idx = np.array([k * (nxnu + 1) for k in range(problem.nx)])
-        R_diag_idx = np.array(
-            [(problem.nx + k) * (nxnu + 1) for k in range(problem.nu)]
-        )
-
         def rollout_acados_for_grad(x_init):
             current_states = x_init.copy()
             x_traj = np.zeros((sim_steps + 1, n_batch, problem.nx))
@@ -307,8 +298,7 @@ def benchmark_acados_rollout(
                 x_traj[step + 1] = new_states.copy()
                 current_states = new_states
 
-            grad_Q = np.zeros(problem.nx)
-            grad_R = np.zeros(problem.nu)
+            grad_QR_diag = np.zeros(problem.nx+problem.nu)
             phi_batch = [np.zeros(problem.nx) for _ in range(n_batch)]
 
             for step in reversed(range(sim_steps)):
@@ -334,8 +324,7 @@ def benchmark_acados_rollout(
                     seed_x=None, seed_u=[(0, all_seeds)], sanity_checks=False
                 )  # (n_batch, 1, np_global)
 
-                grad_Q += p_sens_batch[:, 0, Q_diag_idx].sum(axis=0)
-                grad_R += p_sens_batch[:, 0, R_diag_idx].sum(axis=0)
+                grad_QR_diag += p_sens_batch[:, 0, :].sum(axis=0)
 
                 # Update phi_batch per-element (K_t varies per batch element)
                 for j in range(n_batch):
@@ -345,6 +334,9 @@ def benchmark_acados_rollout(
                         problem.dynamics.A + problem.dynamics.B @ K_t
                     )  # closed-loop matrix (nx, nx)
                     phi_batch[j] = BK.T @ (2.0 * x_next[j] + phi) + 2.0 * K_t.T @ u_t[j]
+
+            grad_Q = grad_QR_diag[:problem.nx]
+            grad_R = grad_QR_diag[problem.nx:]
 
             return grad_Q, grad_R
 
