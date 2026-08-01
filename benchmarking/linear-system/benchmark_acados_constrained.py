@@ -87,22 +87,8 @@ def create_acados_solver(
     model.u = ca.SX.sym("u", nu)
     model.name = f"linear_mpc_bench_{seed}"
 
-    A_mat = ca.SX.sym("A", nx, nx)
-    B_mat = ca.SX.sym("B", nx, nu)
-    b = ca.SX.sym("b", nx)
-    model.p_global = ca.vertcat(
-        *[A_mat.reshape((-1, 1)), B_mat.reshape((-1, 1)), b.reshape((-1, 1))]
-    )
-    ocp.p_global_values = np.concatenate(
-        (
-            problem.dynamics.A.flatten(order="F"),
-            problem.dynamics.B.flatten(order="F"),
-            problem.dynamics.b,
-        )
-    )
-
     ocp.solver_options.integrator_type = "DISCRETE"
-    model.disc_dyn_expr = A_mat @ model.x + B_mat @ model.u + b
+    model.disc_dyn_expr = problem.dynamics.A @ model.x + problem.dynamics.B @ model.u + problem.dynamics.b
 
     # Cost
     ocp.cost.cost_type = "EXTERNAL"
@@ -213,17 +199,9 @@ def benchmark_acados_rollout(
             tol=tol,
         )
 
-        p_global_base = np.concatenate(
-            (
-                problem.dynamics.A.flatten(order="F"),
-                problem.dynamics.B.flatten(order="F"),
-                problem.dynamics.b,
-            )
-        )
-
         def build_p_global(Q_mat: np.ndarray, R_mat: np.ndarray) -> np.ndarray:
             H_mat_val = scipy.linalg.block_diag(Q_mat, R_mat)
-            return np.concatenate((p_global_base, H_mat_val.flatten(order="F")))
+            return H_mat_val.flatten(order="F")
 
         def prepare_batch_step(
             current_states: np.ndarray, p_global_values: np.ndarray
@@ -289,17 +267,13 @@ def benchmark_acados_rollout(
         all_costs.append(final_cost)
 
         # Gradient computation
-        # p_global layout: [A.flat(F), B.flat(F), b, H.flat(F)]  (sizes: nx^2, nx*nu, nx, (nx+nu)^2)
+        # p_global layout: [ H.flat(F)]  ((nx+nu)^2)
         # H = block_diag(Q, R), so diag(H)[: nx] = diag(Q), diag(H)[nx:] = diag(R).
         # From the flat Fortran-order H vector, the k-th diagonal entry is at index k*(nx+nu+1).
         nxnu = problem.nx + problem.nu
-        H_offset = (
-            problem.nx**2 + problem.nx * problem.nu + problem.nx
-        )  # start of H in p_global
-
         # Indices in p_global for diag(Q) and diag(R)
-        Q_diag_idx = H_offset + np.array([k * (nxnu + 1) for k in range(problem.nx)])
-        R_diag_idx = H_offset + np.array(
+        Q_diag_idx = np.array([k * (nxnu + 1) for k in range(problem.nx)])
+        R_diag_idx = np.array(
             [(problem.nx + k) * (nxnu + 1) for k in range(problem.nu)]
         )
 
