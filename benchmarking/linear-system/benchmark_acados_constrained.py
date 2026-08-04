@@ -296,8 +296,8 @@ def benchmark_acados_rollout(
                 x_traj[step + 1] = new_states.copy()
                 current_states = new_states
 
-            grad_QR_diag = np.zeros(problem.nx+problem.nu)
-            phi_batch = [np.zeros(problem.nx) for _ in range(n_batch)]
+            grad_QR_diag = np.zeros(problem.nx + problem.nu)
+            phi_batch = np.zeros((n_batch, problem.nx), dtype=np.float64)
 
             for step in reversed(range(sim_steps)):
                 x_t = x_traj[step]
@@ -305,10 +305,11 @@ def benchmark_acados_rollout(
                 u_t = u_traj[step]
 
                 prepare_batch_step(x_t, p_global_updated)
+                # TODO: load iterate instead.
                 solver.solve()
 
-                # Vectorized seed computation: # (n_batch, nu)
-                phi_arr = np.stack(phi_batch)  # (n_batch, nx)
+                # Vectorized seed computation: (n_batch, nu)
+                phi_arr = phi_batch
                 all_seeds = (
                     2.0 * u_t
                     + 2.0 * (problem.dynamics.B.T @ x_next.T).T
@@ -324,14 +325,16 @@ def benchmark_acados_rollout(
 
                 grad_QR_diag += p_sens_batch[:, 0, :].sum(axis=0)
 
-                # Update phi_batch per-element (K_t varies per batch element)
-                for j in range(n_batch):
-                    K_t = K_traj[step][j]
-                    phi = phi_batch[j]
-                    BK = (
-                        problem.dynamics.A + problem.dynamics.B @ K_t
-                    )  # closed-loop matrix (nx, nx)
-                    phi_batch[j] = BK.T @ (2.0 * x_next[j] + phi) + 2.0 * K_t.T @ u_t[j]
+                # Update phi_batch
+                K_batch = K_traj[step]  # (n_batch, nu, nx)
+                BK_batch = problem.dynamics.A[None, :, :] + np.matmul(
+                    problem.dynamics.B[None, :, :], K_batch
+                )  # (n_batch, nx, nx)
+                rhs = 2.0 * x_next + phi_batch  # (n_batch, nx)
+
+                term1 = np.einsum("bij,bj->bi", np.swapaxes(BK_batch, 1, 2), rhs)
+                term2 = np.einsum("bki,bi->bk", np.swapaxes(K_batch, 1, 2), u_t)
+                phi_batch = term1 + 2.0 * term2
 
             grad_Q = grad_QR_diag[:problem.nx]
             grad_R = grad_QR_diag[problem.nx:]
