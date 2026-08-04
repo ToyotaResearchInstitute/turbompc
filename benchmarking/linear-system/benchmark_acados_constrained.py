@@ -273,9 +273,12 @@ def benchmark_acados_rollout(
 
             p_global_updated = build_p_global(Q, R)
 
+            ocp_batch_solutions = sim_steps * [None]
+
             for step in range(sim_steps):
                 prepare_batch_step(current_states, p_global_updated)
                 solver.solve()
+                ocp_batch_solutions[step] = solver.get_flat_iterate()
 
                 u_sol = solver.get_flat("u").reshape((n_batch, HORIZON - 1, problem.nu))
                 u_applied = u_sol[:, 0, :]  # (n_batch, nu)
@@ -301,8 +304,8 @@ def benchmark_acados_rollout(
                 u_t = u_traj[step]
 
                 prepare_batch_step(x_t, p_global_updated)
-                # TODO: load iterate instead.
-                solver.solve()
+                # load solution to be differentiated
+                solver.set_iterate(ocp_batch_solutions[step])
 
                 # Vectorized seed computation: (n_batch, nu)
                 phi_arr = phi_batch
