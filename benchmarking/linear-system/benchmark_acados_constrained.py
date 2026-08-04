@@ -211,15 +211,6 @@ def benchmark_acados_rollout(
             p_global_batch = np.tile(p_global_values, (n_batch, 1))
             solver.set_p_global_and_precompute_dependencies(p_global_batch)
 
-        def advance_dynamics(
-            current_states: np.ndarray, u_applied: np.ndarray
-        ) -> np.ndarray:
-            return (
-                problem.dynamics.A @ current_states.T
-                + problem.dynamics.B @ u_applied.T
-                + problem.dynamics.b.reshape(-1, 1)
-            ).T
-
         def solve_batch_step(
             current_states: np.ndarray, p_global_values: np.ndarray
         ) -> tuple[np.ndarray, np.ndarray]:
@@ -227,7 +218,8 @@ def benchmark_acados_rollout(
             solver.solve()
             u_sol = solver.get_flat("u").reshape((n_batch, HORIZON - 1, problem.nu))
             u_applied = u_sol[:, 0, :]
-            new_states = advance_dynamics(current_states, u_applied)
+            # advance dynamics: here MPC and "real" dynamics coincide, so get x from solver.
+            new_states = solver.get(1, 'x')
             return u_applied, new_states
 
         def rollout_with_costs(
@@ -288,7 +280,8 @@ def benchmark_acados_rollout(
 
                 K_step = solver.eval_solution_sensitivity(stages=0, with_respect_to="initial_state", sanity_checks=False, return_sens_x=False, return_sens_u=True)['sens_u']
 
-                new_states = advance_dynamics(current_states, u_applied)
+                # advance dynamics: here MPC and "real" dynamics coincide, so get x from solver.
+                new_states = solver.get(1, 'x')
 
                 u_traj[step] = u_applied.copy()
                 K_traj[step] = K_step
