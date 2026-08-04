@@ -282,12 +282,8 @@ def benchmark_acados_rollout(
 
                 K_step = np.zeros((n_batch, problem.nu, problem.nx))
                 solver.setup_qp_matrices_and_factorize(n_batch)
-                for j in range(n_batch):
-                    result = solver.ocp_solvers[j].eval_solution_sensitivity(
-                        stages=0, with_respect_to="initial_state",
-                        sanity_checks=False
-                    )
-                    K_step[j] = result["sens_u"]
+
+                K_step = solver.eval_solution_sensitivity(stages=0, with_respect_to="initial_state", sanity_checks=False, return_sens_x=False, return_sens_u=True)['sens_u']
 
                 new_states = advance_dynamics(current_states, u_applied)
 
