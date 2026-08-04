@@ -216,8 +216,7 @@ def benchmark_acados_rollout(
         ) -> tuple[np.ndarray, np.ndarray]:
             prepare_batch_step(current_states, p_global_values)
             solver.solve()
-            u_sol = solver.get_flat("u").reshape((n_batch, HORIZON - 1, problem.nu))
-            u_applied = u_sol[:, 0, :]
+            u_applied = solver.get(0, "u")
             # advance dynamics: here MPC and "real" dynamics coincide, so get x from solver.
             new_states = solver.get(1, 'x')
             return u_applied, new_states
