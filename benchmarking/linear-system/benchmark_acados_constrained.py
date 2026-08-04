@@ -206,12 +206,10 @@ def benchmark_acados_rollout(
         def prepare_batch_step(
             current_states: np.ndarray, p_global_values: np.ndarray
         ) -> None:
-            for j in range(n_batch):
-                solver.ocp_solvers[j].set(0, "lbx", current_states[j, :])
-                solver.ocp_solvers[j].set(0, "ubx", current_states[j, :])
-                solver.ocp_solvers[j].set_p_global_and_precompute_dependencies(
-                    p_global_values
-                )
+            solver.constraints_set(0, "lbx", current_states)
+            solver.constraints_set(0, "ubx", current_states)
+            p_global_batch = np.tile(p_global_values, (n_batch, 1))
+            solver.set_p_global_and_precompute_dependencies(p_global_batch)
 
         def advance_dynamics(
             current_states: np.ndarray, u_applied: np.ndarray
