@@ -145,7 +145,7 @@ def create_acados_solver(
     import tempfile
 
     build_dir = tempfile.mkdtemp(prefix="acados_")
-    ocp.solver_options.build_dir = build_dir
+    ocp.code_gen_options.code_export_directory = build_dir
 
     # Create batch solver ONCE
     solver = AcadosOcpBatchSolver(
