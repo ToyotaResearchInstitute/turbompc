@@ -30,12 +30,10 @@ class LinearDiscreteDynamics:
 
 @dataclass
 class QuadraticCost:
-    """Quadratic cost 0.5 x^T Q x + 0.5 u^T R u + x^T r + u^T q."""
+    """Quadratic cost 0.5 x^T Q x + 0.5 u^T R u"""
 
     Q: np.ndarray
     R: np.ndarray
-    r: np.ndarray
-    q: np.ndarray
 
 
 @dataclass
@@ -83,39 +81,27 @@ def create_acados_solver(
 
     ocp = AcadosOcp()
     model: AcadosModel = ocp.model
-    model.x = ca.SX.sym("x", nx)
-    model.u = ca.SX.sym("u", nu)
+    model.x = ca.MX.sym("x", nx)
+    model.u = ca.MX.sym("u", nu)
     model.name = f"linear_mpc_bench_{seed}"
 
-    A_mat = ca.SX.sym("A", nx, nx)
-    B_mat = ca.SX.sym("B", nx, nu)
-    b = ca.SX.sym("b", nx)
-    model.p_global = ca.vertcat(
-        *[A_mat.reshape((-1, 1)), B_mat.reshape((-1, 1)), b.reshape((-1, 1))]
-    )
-    ocp.p_global_values = np.concatenate(
-        (
-            problem.dynamics.A.flatten(order="F"),
-            problem.dynamics.B.flatten(order="F"),
-            problem.dynamics.b,
-        )
-    )
-
     ocp.solver_options.integrator_type = "DISCRETE"
-    model.disc_dyn_expr = A_mat @ model.x + B_mat @ model.u + b
+    model.disc_dyn_expr = problem.dynamics.A @ model.x + problem.dynamics.B @ model.u + problem.dynamics.b
+
+    # parameters
+    p_Q_diag = ca.MX.sym("p_Q_diag", nx)
+    p_R_diag = ca.MX.sym("p_Q_diag", nu)
+    ocp.model.p_global = ca.vertcat(*[ocp.model.p_global, p_Q_diag, p_R_diag])
+    ocp.p_global_values = np.concatenate(
+        (ocp.p_global_values, np.diag(problem.cost.Q), np.diag(problem.cost.R))
+    )
 
     # Cost
     ocp.cost.cost_type = "EXTERNAL"
     ocp.cost.cost_type_e = "EXTERNAL"
-    H_mat = ca.SX.sym("H", nx + nu, nx + nu)
     xu = ca.vertcat(model.x, model.u)
-    ocp.model.cost_expr_ext_cost = ca.mtimes([xu.T, H_mat, xu])
-    ocp.model.cost_expr_ext_cost_e = ca.mtimes([model.x.T, H_mat[:nx, :nx], model.x])
-    ocp.model.p_global = ca.vertcat(*[ocp.model.p_global, H_mat.reshape((-1, 1))])
-    H_mat_val = scipy.linalg.block_diag(problem.cost.Q, problem.cost.R)
-    ocp.p_global_values = np.concatenate(
-        (ocp.p_global_values, H_mat_val.flatten(order="F"))
-    )
+    ocp.model.cost_expr_ext_cost = ca.mtimes([xu.T, ca.diag(ca.vertcat(p_Q_diag, p_R_diag)), xu])
+    ocp.model.cost_expr_ext_cost_e = ca.mtimes([model.x.T, ca.diag(p_Q_diag), model.x])
 
     # Constraints
     ocp.constraints.lbu = problem.control_bounds.u_lower
@@ -131,8 +117,8 @@ def create_acados_solver(
     ocp.solver_options.with_batch_functionality = True
 
     if compute_gradient:
+        ocp.code_gen_options.with_solution_sens_wrt_params_adj = True
         ocp.solver_options.hessian_approx = "EXACT"
-        ocp.solver_options.with_solution_sens_wrt_params = True
         ocp.solver_options.qp_solver_cond_ric_alg = 0
         ocp.solver_options.qp_solver_ric_alg = (
             0  # classic Riccati required for eval_solution_sensitivity
@@ -145,7 +131,7 @@ def create_acados_solver(
     import tempfile
 
     build_dir = tempfile.mkdtemp(prefix="acados_")
-    ocp.solver_options.build_dir = build_dir
+    ocp.code_gen_options.code_export_directory = build_dir
 
     # Create batch solver ONCE
     solver = AcadosOcpBatchSolver(
@@ -191,7 +177,7 @@ def benchmark_acados_rollout(
         )
 
         # Problem object
-        quadratic_cost = QuadraticCost(Q, R, np.zeros(nx), np.zeros(nu))
+        quadratic_cost = QuadraticCost(Q, R)
         dynamics = LinearDiscreteDynamics(A_base, B_base, b_base)
         u_lower = -umax * np.ones((nu,), dtype=np.float64)
         u_upper = umax * np.ones((nu,), dtype=np.float64)
@@ -213,45 +199,26 @@ def benchmark_acados_rollout(
             tol=tol,
         )
 
-        p_global_base = np.concatenate(
-            (
-                problem.dynamics.A.flatten(order="F"),
-                problem.dynamics.B.flatten(order="F"),
-                problem.dynamics.b,
-            )
-        )
-
         def build_p_global(Q_mat: np.ndarray, R_mat: np.ndarray) -> np.ndarray:
-            H_mat_val = scipy.linalg.block_diag(Q_mat, R_mat)
-            return np.concatenate((p_global_base, H_mat_val.flatten(order="F")))
+            p_global_val = np.concatenate([np.diag(Q_mat), np.diag(R_mat)])
+            return p_global_val
 
         def prepare_batch_step(
             current_states: np.ndarray, p_global_values: np.ndarray
         ) -> None:
-            for j in range(n_batch):
-                solver.ocp_solvers[j].set(0, "lbx", current_states[j, :])
-                solver.ocp_solvers[j].set(0, "ubx", current_states[j, :])
-                solver.ocp_solvers[j].set_p_global_and_precompute_dependencies(
-                    p_global_values
-                )
-
-        def advance_dynamics(
-            current_states: np.ndarray, u_applied: np.ndarray
-        ) -> np.ndarray:
-            return (
-                problem.dynamics.A @ current_states.T
-                + problem.dynamics.B @ u_applied.T
-                + problem.dynamics.b.reshape(-1, 1)
-            ).T
+            solver.constraints_set(0, "lbx", current_states)
+            solver.constraints_set(0, "ubx", current_states)
+            p_global_batch = np.tile(p_global_values, (n_batch, 1))
+            solver.set_p_global_and_precompute_dependencies(p_global_batch)
 
         def solve_batch_step(
             current_states: np.ndarray, p_global_values: np.ndarray
         ) -> tuple[np.ndarray, np.ndarray]:
             prepare_batch_step(current_states, p_global_values)
             solver.solve()
-            u_sol = solver.get_flat("u").reshape((n_batch, HORIZON - 1, problem.nu))
-            u_applied = u_sol[:, 0, :]
-            new_states = advance_dynamics(current_states, u_applied)
+            u_applied = solver.get(0, "u")
+            # advance dynamics: here MPC and "real" dynamics coincide, so get x from solver.
+            new_states = solver.get(1, 'x')
             return u_applied, new_states
 
         def rollout_with_costs(
@@ -288,21 +255,6 @@ def benchmark_acados_rollout(
         all_times_fwd.append(total_time)
         all_costs.append(final_cost)
 
-        # Gradient computation
-        # p_global layout: [A.flat(F), B.flat(F), b, H.flat(F)]  (sizes: nx^2, nx*nu, nx, (nx+nu)^2)
-        # H = block_diag(Q, R), so diag(H)[: nx] = diag(Q), diag(H)[nx:] = diag(R).
-        # From the flat Fortran-order H vector, the k-th diagonal entry is at index k*(nx+nu+1).
-        nxnu = problem.nx + problem.nu
-        H_offset = (
-            problem.nx**2 + problem.nx * problem.nu + problem.nx
-        )  # start of H in p_global
-
-        # Indices in p_global for diag(Q) and diag(R)
-        Q_diag_idx = H_offset + np.array([k * (nxnu + 1) for k in range(problem.nx)])
-        R_diag_idx = H_offset + np.array(
-            [(problem.nx + k) * (nxnu + 1) for k in range(problem.nu)]
-        )
-
         def rollout_acados_for_grad(x_init):
             current_states = x_init.copy()
             x_traj = np.zeros((sim_steps + 1, n_batch, problem.nx))
@@ -312,31 +264,31 @@ def benchmark_acados_rollout(
 
             p_global_updated = build_p_global(Q, R)
 
+            ocp_batch_solutions = sim_steps * [None]
+
             for step in range(sim_steps):
                 prepare_batch_step(current_states, p_global_updated)
                 solver.solve()
+                ocp_batch_solutions[step] = solver.get_flat_iterate()
 
                 u_sol = solver.get_flat("u").reshape((n_batch, HORIZON - 1, problem.nu))
                 u_applied = u_sol[:, 0, :]  # (n_batch, nu)
 
                 K_step = np.zeros((n_batch, problem.nu, problem.nx))
                 solver.setup_qp_matrices_and_factorize(n_batch)
-                for j in range(n_batch):
-                    result = solver.ocp_solvers[j].eval_solution_sensitivity(
-                        stages=0, with_respect_to="initial_state"
-                    )
-                    K_step[j] = result["sens_u"]
 
-                new_states = advance_dynamics(current_states, u_applied)
+                K_step = solver.eval_solution_sensitivity(stages=0, with_respect_to="initial_state", sanity_checks=False, return_sens_x=False, return_sens_u=True)['sens_u']
+
+                # advance dynamics: here MPC and "real" dynamics coincide, so get x from solver.
+                new_states = solver.get(1, 'x')
 
                 u_traj[step] = u_applied.copy()
                 K_traj[step] = K_step
                 x_traj[step + 1] = new_states.copy()
                 current_states = new_states
 
-            grad_Q = np.zeros(problem.nx)
-            grad_R = np.zeros(problem.nu)
-            phi_batch = [np.zeros(problem.nx) for _ in range(n_batch)]
+            grad_QR_diag = np.zeros(problem.nx + problem.nu)
+            phi_batch = np.zeros((n_batch, problem.nx), dtype=np.float64)
 
             for step in reversed(range(sim_steps)):
                 x_t = x_traj[step]
@@ -344,10 +296,11 @@ def benchmark_acados_rollout(
                 u_t = u_traj[step]
 
                 prepare_batch_step(x_t, p_global_updated)
-                solver.solve()
+                # load solution to be differentiated
+                solver.set_iterate(ocp_batch_solutions[step])
 
-                # Vectorized seed computation: # (n_batch, nu)
-                phi_arr = np.stack(phi_batch)  # (n_batch, nx)
+                # Vectorized seed computation: (n_batch, nu)
+                phi_arr = phi_batch
                 all_seeds = (
                     2.0 * u_t
                     + 2.0 * (problem.dynamics.B.T @ x_next.T).T
@@ -361,17 +314,21 @@ def benchmark_acados_rollout(
                     seed_x=None, seed_u=[(0, all_seeds)], sanity_checks=False
                 )  # (n_batch, 1, np_global)
 
-                grad_Q += p_sens_batch[:, 0, Q_diag_idx].sum(axis=0)
-                grad_R += p_sens_batch[:, 0, R_diag_idx].sum(axis=0)
+                grad_QR_diag += p_sens_batch[:, 0, :].sum(axis=0)
 
-                # Update phi_batch per-element (K_t varies per batch element)
-                for j in range(n_batch):
-                    K_t = K_traj[step][j]
-                    phi = phi_batch[j]
-                    BK = (
-                        problem.dynamics.A + problem.dynamics.B @ K_t
-                    )  # closed-loop matrix (nx, nx)
-                    phi_batch[j] = BK.T @ (2.0 * x_next[j] + phi) + 2.0 * K_t.T @ u_t[j]
+                # Update phi_batch
+                K_batch = K_traj[step]  # (n_batch, nu, nx)
+                BK_batch = problem.dynamics.A[None, :, :] + np.matmul(
+                    problem.dynamics.B[None, :, :], K_batch
+                )  # (n_batch, nx, nx)
+                rhs = 2.0 * x_next + phi_batch  # (n_batch, nx)
+
+                term1 = np.einsum("bij,bj->bi", np.swapaxes(BK_batch, 1, 2), rhs)
+                term2 = np.einsum("bki,bi->bk", np.swapaxes(K_batch, 1, 2), u_t)
+                phi_batch = term1 + 2.0 * term2
+
+            grad_Q = grad_QR_diag[:problem.nx]
+            grad_R = grad_QR_diag[problem.nx:]
 
             return grad_Q, grad_R
 
