@@ -1,17 +1,93 @@
-#include <cstdint>
-#include <string>
+#include "ffi_device_memory.h"
+#include "admm_cudss.cuh"
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
-#include "admm_cudss.cuh"
+#include <cstdint>
+#include <string>
 
 namespace ffi = xla::ffi;
+uint64_t CreateAdmmCudssWorkspace();
+int EnsureAdmmCudssWorkspaceCapacity(turbompc::FfiDeviceAllocator&, uint64_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t);
+int DestroyAdmmCudssWorkspace(turbompc::FfiDeviceAllocator&, uint64_t);
+const char* AdmmCudssLastError();
 
 using BufF32 = ffi::Buffer<ffi::DataType::F32>;
 using BufF64 = ffi::Buffer<ffi::DataType::F64>;
 using BufU32 = ffi::Buffer<ffi::DataType::U32>;
 
+static ffi::Error CreateWorkspace(cudaStream_t stream, ffi::Result<BufU32> result) {
+    const uint64_t handle = CreateAdmmCudssWorkspace();
+    if (!handle) return ffi::Error::Internal(AdmmCudssLastError());
+    const cudaError_t error = cudaMemcpyAsync(result->typed_data(), &handle,
+                                              sizeof(handle), cudaMemcpyHostToDevice, stream);
+    return error == cudaSuccess ? ffi::Error::Success()
+                                : ffi::Error::Internal(cudaGetErrorString(error));
+}
+
+static ffi::Error EnsureWorkspaceCapacity(
+    turbompc::FfiDeviceAllocator allocator, cudaStream_t stream,
+    int64_t workspace_handle, int64_t batch_size, int64_t T, int64_t n,
+    int64_t nx, int64_t n0, int64_t m, int64_t dtype_bytes,
+    ffi::Result<BufU32> result) {
+    const int status = EnsureAdmmCudssWorkspaceCapacity(
+        allocator, workspace_handle, batch_size, T, n, nx, n0, m,
+        dtype_bytes);
+    if (status) return ffi::Error::Internal(AdmmCudssLastError());
+    const cudaError_t error =
+        cudaMemsetAsync(result->typed_data(), 0, sizeof(uint32_t), stream);
+    return error == cudaSuccess ? ffi::Error::Success()
+                                : ffi::Error::Internal(cudaGetErrorString(error));
+}
+
+static ffi::Error DestroyWorkspace(
+    turbompc::FfiDeviceAllocator allocator, cudaStream_t stream,
+    int64_t workspace_handle, ffi::Result<BufU32> result) {
+    const int status = DestroyAdmmCudssWorkspace(allocator, workspace_handle);
+    if (status) return ffi::Error::Internal(AdmmCudssLastError());
+    const cudaError_t error =
+        cudaMemsetAsync(result->typed_data(), 0, sizeof(uint32_t), stream);
+    return error == cudaSuccess ? ffi::Error::Success()
+                                : ffi::Error::Internal(cudaGetErrorString(error));
+}
+
+extern "C" XLA_FFI_Error*
+TurboMpcCreateAdmmCudssWorkspace(XLA_FFI_CallFrame* frame) {
+    static auto* handler = ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Ret<BufU32>().To(CreateWorkspace).release();
+    return handler->Call(frame);
+}
+
+extern "C" XLA_FFI_Error*
+TurboMpcEnsureAdmmCudssWorkspaceCapacity(XLA_FFI_CallFrame* frame) {
+    static auto* handler = ffi::Ffi::Bind()
+        .Ctx<turbompc::FfiDeviceAllocator>()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Attr<int64_t>("workspace_handle").Attr<int64_t>("batch_size")
+        .Attr<int64_t>("T").Attr<int64_t>("n").Attr<int64_t>("nx")
+        .Attr<int64_t>("n0").Attr<int64_t>("m")
+        .Attr<int64_t>("dtype_bytes")
+        .Ret<BufU32>()
+        .To(EnsureWorkspaceCapacity)
+        .release();
+    return handler->Call(frame);
+}
+
+extern "C" XLA_FFI_Error*
+TurboMpcDestroyAdmmCudssWorkspace(XLA_FFI_CallFrame* frame) {
+    static auto* handler = ffi::Ffi::Bind()
+        .Ctx<turbompc::FfiDeviceAllocator>()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Attr<int64_t>("workspace_handle")
+        .Ret<BufU32>()
+        .To(DestroyWorkspace)
+        .release();
+    return handler->Call(frame);
+}
+
 template<typename BufT, typename Scalar>
 static ffi::Error AdmmCudssCudaImpl(
+    turbompc::FfiDeviceAllocator allocator,
     cudaStream_t stream,
     // QP data
     BufT S, BufT D, BufT E, BufT q,
@@ -24,14 +100,18 @@ static ffi::Error AdmmCudssCudaImpl(
     BufT xi_g0, BufT rho_bar_init,
     BufT slack_weight_init,
     // Config attrs
-    int64_t max_iter, int64_t check_every, int64_t adapt_rho_every,
-    double eps_abs, double eps_rel, double sigma,
+    int64_t max_iter, int64_t check_termination_every,
+    int64_t check_infeasibility_every, int64_t adapt_rho_every,
+    int64_t constraint_handling,
+    double eps_abs, double eps_rel, double eps_prim_inf, double eps_dual_inf,
+    double sigma,
     double rho_f_factor, double alpha,
-    double adaptive_rho_tolerance, double rho_min, double rho_max,
+    double adaptive_rho_tolerance, double rho_update_max_factor,
+    double rho_min, double rho_max, double log_barrier_kappa,
     int64_t nx64, int64_t n064, int64_t m64,
     int64_t use_slack64,
-    // Results (10)
-    ffi::Result<BufT>  x_out,
+    int64_t workspace_handle,
+    // Results (final state, statistics, and timing)
     ffi::Result<BufU32> iters_out,
     ffi::Result<BufT>  x_blocks_out,
     ffi::Result<BufT>  z_g_out,
@@ -40,7 +120,9 @@ static ffi::Error AdmmCudssCudaImpl(
     ffi::Result<BufT>  y_f_dyn_out,
     ffi::Result<BufT>  xi_g_out,
     ffi::Result<BufT>  rho_bar_out,
-    ffi::Result<BufT>  kernel_ns_out)
+    ffi::Result<BufT>  kernel_ns_out,
+    ffi::Result<BufU32> status_out,
+    ffi::Result<BufT> terminal_residuals_out)
 {
     // Extract dimensions from S shape: [Nb, T, n, 3n] or [T, n, 3n] (Nb=1)
     auto Sd = S.dimensions();
@@ -66,23 +148,32 @@ static ffi::Error AdmmCudssCudaImpl(
     // Build config
     ADMMCudssConfig cfg;
     cfg.max_iter               = static_cast<int32_t>(max_iter);
-    cfg.check_every            = static_cast<int32_t>(check_every);
+    cfg.check_termination_every =
+        static_cast<int32_t>(check_termination_every);
+    cfg.check_infeasibility_every =
+        static_cast<int32_t>(check_infeasibility_every);
     cfg.adapt_rho_every        = static_cast<int32_t>(adapt_rho_every);
+    cfg.constraint_handling    = static_cast<ConstraintHandling>(constraint_handling);
     cfg.eps_abs                = eps_abs;
     cfg.eps_rel                = eps_rel;
+    cfg.eps_prim_inf           = eps_prim_inf;
+    cfg.eps_dual_inf           = eps_dual_inf;
     cfg.sigma                  = sigma;
     cfg.rho_f_factor           = rho_f_factor;
     cfg.alpha                  = alpha;
     cfg.adaptive_rho_tolerance = adaptive_rho_tolerance;
+    cfg.rho_update_max_factor  = rho_update_max_factor;
     cfg.rho_min                = rho_min;
     cfg.rho_max                = rho_max;
+    cfg.log_barrier_kappa      = log_barrier_kappa;
     cfg.use_slack              = (use_slack64 != 0);
 
     try {
         if constexpr (std::is_same_v<Scalar, float>) {
             LaunchADMMCudssF32(
+                allocator,
+                static_cast<uint64_t>(workspace_handle),
                 stream,
-                x_out->typed_data(),
                 iters_out->typed_data(),
                 x_blocks_out->typed_data(),
                 z_g_out->typed_data(),
@@ -92,6 +183,7 @@ static ffi::Error AdmmCudssCudaImpl(
                 xi_g_out->typed_data(),
                 rho_bar_out->typed_data(),
                 kernel_ns_out->typed_data(),
+                status_out->typed_data(), terminal_residuals_out->typed_data(),
                 S.typed_data(),
                 D.typed_data(), E.typed_data(), q.typed_data(),
                 A0.typed_data(), A_minus.typed_data(), A_plus.typed_data(),
@@ -104,8 +196,9 @@ static ffi::Error AdmmCudssCudaImpl(
                 T, n, nx, n0, m, Nb, cfg);
         } else {
             LaunchADMMCudssF64(
+                allocator,
+                static_cast<uint64_t>(workspace_handle),
                 stream,
-                x_out->typed_data(),
                 iters_out->typed_data(),
                 x_blocks_out->typed_data(),
                 z_g_out->typed_data(),
@@ -115,6 +208,7 @@ static ffi::Error AdmmCudssCudaImpl(
                 xi_g_out->typed_data(),
                 rho_bar_out->typed_data(),
                 kernel_ns_out->typed_data(),
+                status_out->typed_data(), terminal_residuals_out->typed_data(),
                 S.typed_data(),
                 D.typed_data(), E.typed_data(), q.typed_data(),
                 A0.typed_data(), A_minus.typed_data(), A_plus.typed_data(),
@@ -142,6 +236,7 @@ static ffi::Error AdmmCudssCudaImpl(
 extern "C" XLA_FFI_Error* AdmmCudssCuda(XLA_FFI_CallFrame* call_frame) {
     static auto* handler =
         ffi::Ffi::Bind()
+            .Ctx<turbompc::FfiDeviceAllocator>()
             .Ctx<ffi::PlatformStream<cudaStream_t>>()
             // QP data
             .Arg<BufF32>()   // S
@@ -167,22 +262,28 @@ extern "C" XLA_FFI_Error* AdmmCudssCuda(XLA_FFI_CallFrame* call_frame) {
             .Arg<BufF32>()   // slack_weight_init
             // Config attrs
             .Attr<int64_t>("max_iter")
-            .Attr<int64_t>("check_every")
+            .Attr<int64_t>("check_termination_every")
+            .Attr<int64_t>("check_infeasibility_every")
             .Attr<int64_t>("adapt_rho_every")
+            .Attr<int64_t>("constraint_handling")
             .Attr<double>("eps_abs")
             .Attr<double>("eps_rel")
+            .Attr<double>("eps_prim_inf")
+            .Attr<double>("eps_dual_inf")
             .Attr<double>("sigma")
             .Attr<double>("rho_f_factor")
             .Attr<double>("alpha")
             .Attr<double>("adaptive_rho_tolerance")
+            .Attr<double>("rho_update_max_factor")
             .Attr<double>("rho_min")
             .Attr<double>("rho_max")
+            .Attr<double>("log_barrier_kappa")
             .Attr<int64_t>("nx")
             .Attr<int64_t>("n0")
             .Attr<int64_t>("m")
             .Attr<int64_t>("use_slack")
-            // Results (10)
-            .Ret<BufF32>()   // x_out
+            .Attr<int64_t>("workspace_handle")
+            // Results (final state, statistics, and timing)
             .Ret<BufU32>()   // iters_out
             .Ret<BufF32>()   // x_blocks_out
             .Ret<BufF32>()   // z_g_out
@@ -192,6 +293,8 @@ extern "C" XLA_FFI_Error* AdmmCudssCuda(XLA_FFI_CallFrame* call_frame) {
             .Ret<BufF32>()   // xi_g_out
             .Ret<BufF32>()   // rho_bar_out
             .Ret<BufF32>()   // kernel_ns_out
+            .Ret<BufU32>()   // status_out
+            .Ret<BufF32>()   // terminal residuals and limits
             .To(AdmmCudssCudaImpl<BufF32, float>)
             .release();
     return handler->Call(call_frame);
@@ -200,6 +303,7 @@ extern "C" XLA_FFI_Error* AdmmCudssCuda(XLA_FFI_CallFrame* call_frame) {
 extern "C" XLA_FFI_Error* AdmmCudssCudaF64(XLA_FFI_CallFrame* call_frame) {
     static auto* handler =
         ffi::Ffi::Bind()
+            .Ctx<turbompc::FfiDeviceAllocator>()
             .Ctx<ffi::PlatformStream<cudaStream_t>>()
             // QP data
             .Arg<BufF64>()   // S
@@ -225,22 +329,28 @@ extern "C" XLA_FFI_Error* AdmmCudssCudaF64(XLA_FFI_CallFrame* call_frame) {
             .Arg<BufF64>()   // slack_weight_init
             // Config attrs
             .Attr<int64_t>("max_iter")
-            .Attr<int64_t>("check_every")
+            .Attr<int64_t>("check_termination_every")
+            .Attr<int64_t>("check_infeasibility_every")
             .Attr<int64_t>("adapt_rho_every")
+            .Attr<int64_t>("constraint_handling")
             .Attr<double>("eps_abs")
             .Attr<double>("eps_rel")
+            .Attr<double>("eps_prim_inf")
+            .Attr<double>("eps_dual_inf")
             .Attr<double>("sigma")
             .Attr<double>("rho_f_factor")
             .Attr<double>("alpha")
             .Attr<double>("adaptive_rho_tolerance")
+            .Attr<double>("rho_update_max_factor")
             .Attr<double>("rho_min")
             .Attr<double>("rho_max")
+            .Attr<double>("log_barrier_kappa")
             .Attr<int64_t>("nx")
             .Attr<int64_t>("n0")
             .Attr<int64_t>("m")
             .Attr<int64_t>("use_slack")
-            // Results (10)
-            .Ret<BufF64>()   // x_out
+            .Attr<int64_t>("workspace_handle")
+            // Results (final state, statistics, and timing)
             .Ret<BufU32>()   // iters_out
             .Ret<BufF64>()   // x_blocks_out
             .Ret<BufF64>()   // z_g_out
@@ -250,6 +360,8 @@ extern "C" XLA_FFI_Error* AdmmCudssCudaF64(XLA_FFI_CallFrame* call_frame) {
             .Ret<BufF64>()   // xi_g_out
             .Ret<BufF64>()   // rho_bar_out
             .Ret<BufF64>()   // kernel_ns_out
+            .Ret<BufU32>()   // status_out
+            .Ret<BufF64>()   // terminal residuals and limits
             .To(AdmmCudssCudaImpl<BufF64, double>)
             .release();
     return handler->Call(call_frame);

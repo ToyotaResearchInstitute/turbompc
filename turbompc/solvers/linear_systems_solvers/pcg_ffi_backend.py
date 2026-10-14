@@ -1,33 +1,15 @@
 """PCG solver for block-tridiagonal systems via CUDA FFI."""
 from __future__ import annotations
 
-import ctypes
-from pathlib import Path
 from typing import Optional, Tuple
 
 import jax
 import jax.numpy as jnp
 
+from turbompc.solvers.ffi_loader import load_ffi_lib
 
-def _find_lib() -> Path:
-    """Locate libpcg_blktridi_ffi.so relative to this file or in build/."""
-    turbompc_dir = Path(__file__).resolve().parents[2]
-    repo_root = Path(__file__).resolve().parents[3]
-    candidates = [
-        turbompc_dir / "solvers" / "csrc" / "build" / "libpcg_blktridi_ffi.so",
-        repo_root / "build" / "ffi" / "libpcg_blktridi_ffi.so",
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    raise FileNotFoundError(
-        "Could not find libpcg_blktridi_ffi.so. Build first:\n"
-        "  cmake -S turbompc/solvers/csrc -B build/ffi -DCMAKE_BUILD_TYPE=Release\n"
-        "  cmake --build build/ffi -j\n"
-    )
-
-
-_LIB = ctypes.cdll.LoadLibrary(str(_find_lib()))
+_LIB_NAME = "libpcg_blktridi_ffi.so"
+_LIB = load_ffi_lib(_LIB_NAME)
 
 jax.ffi.register_ffi_target(
     "pcg_blktridi_cuda",
@@ -41,7 +23,7 @@ jax.ffi.register_ffi_target(
 )
 
 
-def pcg_ffi_solve(
+def _pcg_ffi_solve_impl(
     S: jax.Array,
     Phiinv: jax.Array,
     rhs: jax.Array,
@@ -106,3 +88,44 @@ def pcg_ffi_solve(
         return x_out, iters  # (Nb, T, n), (Nb,)
     else:
         return x_out, iters[0]  # (T, n), ()
+
+
+def pcg_ffi_solve(
+    S: jax.Array,
+    Phiinv: jax.Array,
+    rhs: jax.Array,
+    x0: Optional[jax.Array] = None,
+    *,
+    eps: float = 1e-8,
+    max_iters: int = 200,
+) -> Tuple[jax.Array, jax.Array]:
+    """Solve one system, combining surrounding ``vmap`` axes natively."""
+    if x0 is None:
+        x0 = jnp.zeros_like(rhs)
+
+    def solve_one(S, Phiinv, rhs, x0):
+        return _pcg_ffi_solve_impl(S, Phiinv, rhs, x0, eps=eps, max_iters=max_iters)
+
+    solve_one = jax.custom_batching.custom_vmap(solve_one)
+
+    @solve_one.def_vmap
+    def solve_one_vmap(axis_size, in_batched, S, Phiinv, rhs, x0):
+        args = (S, Phiinv, rhs, x0)
+        materialized = tuple(
+            value if is_batched else jnp.broadcast_to(value, (axis_size,) + value.shape)
+            for value, is_batched in zip(args, in_batched)
+        )
+        S_batched, Phiinv_batched, rhs_batched, x0_batched = materialized
+        batch_shape = S_batched.shape[:-3]
+        S_flat = S_batched.reshape((-1,) + S_batched.shape[-3:])
+        Phiinv_flat = Phiinv_batched.reshape((-1,) + Phiinv_batched.shape[-3:])
+        rhs_flat = rhs_batched.reshape((-1,) + rhs_batched.shape[-2:])
+        x0_flat = x0_batched.reshape((-1,) + x0_batched.shape[-2:])
+        solution_flat, iterations_flat = solve_one(
+            S_flat, Phiinv_flat, rhs_flat, x0_flat
+        )
+        solution = solution_flat.reshape(batch_shape + solution_flat.shape[-2:])
+        iterations = iterations_flat.reshape(batch_shape)
+        return (solution, iterations), (True, True)
+
+    return solve_one(S, Phiinv, rhs, x0)

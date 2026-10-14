@@ -16,7 +16,12 @@ from turbompc.dynamics.drone_dynamics import (
     drone_state_dot_parameters
 )
 from turbompc.problems.optimal_control_problem import OptimalControlProblem
-from turbompc.solvers import BackwardBackend, ForwardBackend, TurboMPCSolver
+from turbompc.solvers import (
+    BackwardBackend,
+    ForwardBackend,
+    HessianApproximation,
+    TurboMPCSolver,
+)
 from turbompc.utils.load_params import load_problem_params, load_solver_params
 
 dynamics = DroneDynamics(drone_parameters)
@@ -58,7 +63,7 @@ solver = TurboMPCSolver(
     params=load_solver_params("turbompc.yaml"),
     forward_backend="admm_jax_loop_pcg",
     backward_backend="admm_jax_loop_pcg",
-    use_full_hessian=False,
+    backward_hessian=HessianApproximation.GAUSS_NEWTON,
 )
 ```
 Recommended on the GPU (default parameters):
@@ -68,7 +73,8 @@ solver = TurboMPCSolver(
     params=load_solver_params("turbompc.yaml"),
     forward_backend="admm_fused_cudss",
     backward_backend="direct_cudss_ffi",
-    use_full_hessian=True,
+    forward_hessian=HessianApproximation.GAUSS_NEWTON,
+    backward_hessian=HessianApproximation.FULL_HESSIAN,
 )
 ```
 
@@ -81,7 +87,8 @@ Constructor arguments:
 | `name` | Optional display name |
 | `forward_backend` | Backend for forward QP solves |
 | `backward_backend` | Backend for gradients through the solve |
-| `use_full_hessian` | Include dynamics Hessian terms in gradient calculations |
+| `forward_hessian` | Forward QP Hessian mode; defaults to `HessianApproximation.GAUSS_NEWTON` |
+| `backward_hessian` | Backward Hessian mode; defaults to `HessianApproximation.FULL_HESSIAN` |
 
 Common solver params:
 
@@ -90,11 +97,18 @@ Common solver params:
 | `num_sqp_iteration_max` | Max SQP iterations |
 | `tol_convergence` | SQP stopping tolerance |
 | `convergence_criterion` | `"first_order"` or `"step"` |
-| `linesearch` | Enable backtracking line search |
-| `linesearch_alphas` | Candidate line-search step sizes |
+| `forward_hessian_min_eig` | Eigenvalue floor used by forward Hessian projection (only used with `HessianApproximation.FULL_HESSIAN_PROJECTED`) |
+| `linesearch.method` | Step selection: `"none"`, `"merit"`, or `"filter"` |
+| `linesearch.alphas` | Candidate step sizes used by merit and filter search |
+| `linesearch.merit.armijo_coefficient` | Armijo sufficient-decrease coefficient |
+| `linesearch.filter.constraint_reduction_factor` | Required feasibility reduction |
+| `linesearch.filter.objective_reduction_factor` | Required objective reduction |
 | `admm.rho`, `admm.sigma` | ADMM penalty and regularization values |
 | `admm.max_iter` | Max ADMM iterations per SQP step |
 | `admm.eps_abs`, `admm.eps_rel` | ADMM stopping tolerances |
+| `admm.eps_prim_inf`, `admm.eps_dual_inf` | ADMM infeasibility tolerances |
+| `admm.check_termination_every` | Iterations between termination checks |
+| `admm.check_infeasibility_every` | Iterations between infeasibility checks |
 | `admm.relaxation_parameter` | ADMM relaxation parameter |
 | `admm.pcg.max_iter`, `admm.pcg.tol_epsilon` | PCG settings |
 
@@ -106,13 +120,14 @@ Backend strings:
 | `admm_jax_loop_pcg_ffi` | yes | yes |
 | `admm_jax_loop_cudss_ffi` | yes | yes |
 | `admm_jax_loop_jax_dense` | yes | yes |
+| `admm_jax_loop_eigen` | yes | yes |
 | `admm_fused_pcg` | yes | yes |
 | `admm_fused_cudss` | yes | yes |
 | `direct_jax_dense` | no | yes |
 | `direct_cudss_ffi` | no | yes |
 
-CUDA FFI backends require the CUDA
-extensions described in [cuda-ffi-backends.md](cuda-ffi-backends.md).
+Eigen and CUDA FFI backends require the extensions described in
+[cuda_backends.md](cuda_backends.md).
 
 ## Solving
 
@@ -133,15 +148,14 @@ warm-start state.
 | `states` | `(N+1, nx)` | Planned states |
 | `controls` | `(N+1, nu)` | Planned controls; apply `controls[0]` |
 | `slack` | `(N+1, m)` | Inequality slack values |
-| `status` | scalar | `0` on normal return |
+| `status` | scalar | `SQPStatus` value (`0` means solved) |
 | `num_iter` | scalar | SQP iterations used |
 | `convergence_error` | scalar | Final convergence metric |
 | `admm_iters` | `(num_sqp_iteration_max,)` | ADMM iterations per SQP step |
 | `linesearch_alphas` | optional array | Accepted line-search steps |
 | `admm_state` | `ADMMState` | Internal state for warm-starting |
-| `solver_stats` | `SolverStats` | Per-SQP iteration stats |
+| `stats` | `SQPStats` | SQP and inner-QP statistics |
 | `kkt_state` | `KKTState` | Solver metadata used for differentiation |
-
 
 ## Closed-Loop Warm Starts
 
@@ -195,8 +209,7 @@ Box constraints are enabled by finite bound arrays in `problem_params`.
 Potentially-active constraints are determined when the `OptimalControlProblem` is
 created: recreate the problem and solver if the constraints change.
 
-For soft constraints, use a slack-enabled problem class or adapter, set
-`use_slack_variables=True` and provide `slack_penalization_weight`.
+For soft constraints, set `use_slack_variables=True` and `slack_penalization_weight > 0` in the problem parameters.
 
 
 ## Problem API

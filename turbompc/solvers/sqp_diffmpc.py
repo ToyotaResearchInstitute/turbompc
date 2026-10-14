@@ -7,13 +7,13 @@ support control rate costs, implicit integrators, or inequality constraints.
 
 
 import copy
-import enum
 from functools import partial
 from typing import Any, Dict, NamedTuple, Tuple
 
 import jax
 import jax.numpy as jnp
 from jax import grad, jacfwd
+
 from turbompc.dynamics.integrators import DiscretizationScheme
 from turbompc.problems.optimal_control_problem import OptimalControlProblem
 from turbompc.solvers.linear_systems_solvers.pcg_dual import (
@@ -23,6 +23,7 @@ from turbompc.solvers.linear_systems_solvers.pcg_dual import (
     SchurComplementMatrices,
 )
 from turbompc.solvers.qp_data import QPData, qpdata_from_ocp_blocks
+from turbompc.solvers.status import SQPStatus
 from turbompc.utils.jax_utils import (
     project_matrix_onto_positive_semidefinite_cone,
     value_and_jacrev,
@@ -30,13 +31,6 @@ from turbompc.utils.jax_utils import (
 from turbompc.utils.load_params import load_solver_params
 
 DEFAULT_SOLVER_PARAMS = load_solver_params("sqp.yaml")
-
-
-class SolverReturnStatus(enum.IntEnum):
-    """Status of result after solving the problem."""
-
-    SUCCESS = 0
-    ERROR = -100  # if nans are detected.
 
 
 class SQPSolution(NamedTuple):
@@ -50,7 +44,7 @@ class SQPSolution(NamedTuple):
     dynamics_cost_premultiplied_matrices: QPDynamicsCostPremultipliedMatrices
     schur_complement_matrices: SchurComplementMatrices
 
-    status: SolverReturnStatus
+    status: SQPStatus
     num_iter: int
     convergence_error: float
 
@@ -152,7 +146,7 @@ class SQPDiffMPCSolver:
             self.pcg.zero_qp_data(),
             self.pcg.zero_dynamics_cost_premultiplied_matrices(),
             self.pcg.zero_schur_complement_matrices(),
-            SolverReturnStatus.SUCCESS,
+            SQPStatus.NOT_RUN,
             int(0),  # num_iter
             float(0.0),  # convergence_error
             jnp.zeros(self.maxiter, dtype=float),  # convergence_errors,
@@ -325,6 +319,7 @@ class SQPDiffMPCSolver:
             ),
             ineq_l=jnp.zeros((self.program.horizon + 1, 0)),
             ineq_u=jnp.zeros((self.program.horizon + 1, 0)),
+            slack_penalization_weight=jnp.asarray(0.0, dtype=Qs.dtype),
         )
         As_x_Qinv = jnp.matmul(As, Qinv[:-1])  # vmap(lambda A, B: A @ B)
         Asnext_x_Qinvnext = jnp.matmul(As_next, Qinv[1:])
@@ -626,15 +621,21 @@ class SQPDiffMPCSolver:
         )  # reset num_iter so it runs at least once
         solution = jax.lax.while_loop(cond_fun, sqp_iteration_body, initial_guess)
 
+        nonfinite = (
+            ~jnp.all(jnp.isfinite(solution.states))
+            | ~jnp.all(jnp.isfinite(solution.controls))
+            | ~jnp.isfinite(solution.convergence_error)
+        )
         status = jnp.where(
-            jnp.logical_or(
-                jnp.logical_or(
-                    jnp.isnan(solution.states).any(), jnp.isnan(solution.controls).any()
-                ),
-                solution.convergence_error > self.params["tol_convergence"],
+            nonfinite,
+            jnp.int32(SQPStatus.NONFINITE),
+            # One-step solves report MAX_ITER even if the metric is below tolerance.
+            jnp.where(
+                (self.maxiter > 1)
+                & (solution.convergence_error <= self.params["tol_convergence"]),
+                jnp.int32(SQPStatus.SOLVED),
+                jnp.int32(SQPStatus.MAX_ITER),
             ),
-            SolverReturnStatus.ERROR,
-            SolverReturnStatus.SUCCESS,
         )
         solution = SQPSolution(
             states=jnp.nan_to_num(solution.states),

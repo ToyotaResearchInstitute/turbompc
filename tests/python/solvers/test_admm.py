@@ -1,8 +1,11 @@
 import jax.numpy as jnp
 import numpy as np
+import pytest
+
+from tests.helpers.constraint_handling_fixtures import HANDLINGS
 from tests.helpers.problem_fixtures import cost_blocks_from_qr
 from turbompc.solvers.admm import ADMMSolver
-from turbompc.solvers.admm.admm import compute_gamma, compute_S_Phiinv
+from turbompc.solvers.admm.admm import compute_gamma, compute_S, compute_S_Phiinv
 from turbompc.solvers.linear_systems_solvers.backends import (
     AdmmBackend,
     SchurSolverBackend,
@@ -12,10 +15,12 @@ from turbompc.solvers.linear_systems_solvers.linear_solve import (
 )
 from turbompc.solvers.linear_systems_solvers.schur_solver import make_schur_solver
 from turbompc.solvers.qp_data import qpdata_from_ocp_blocks
-from turbompc.solvers.qp_utils import ZShape
+from turbompc.solvers.qp_utils import ZShape, unpack_x
+from turbompc.solvers.status import ADMMStatus
 
 
-def test_admm_runs_on_toy_ocp():
+@pytest.mark.parametrize(("constraint_handling", "log_barrier_kappa"), HANDLINGS)
+def test_admm_runs_on_toy_ocp(constraint_handling, log_barrier_kappa):
     np.random.seed(0)
     N = 3
     nx = 1
@@ -68,6 +73,7 @@ def test_admm_runs_on_toy_ocp():
         ineq_blocks=ineq_blocks,
         ineq_l=ineq_l,
         ineq_u=ineq_u,
+        slack_penalization_weight=jnp.asarray(0.0, dtype=D.dtype),
     )
 
     zshape = ZShape(horizon=N, num_states=nx, num_controls=nu)
@@ -80,28 +86,27 @@ def test_admm_runs_on_toy_ocp():
         sigma=1.0e-6,
         max_iter=100000,
         admm_backend=AdmmBackend.JAX_LOOP,
+        constraint_handling=constraint_handling,
+        log_barrier_kappa=log_barrier_kappa,
     )
-    (states, controls), stats, _ = solver.solve(
+    result = solver.solve(
         qp_data=qp_data,
         rho_bar=0.1,
     )
+    states, controls = unpack_x(result.state.x_blocks, zshape)
+    stats = result.stats
 
     assert stats.num_iter > 0
+    assert stats.status == ADMMStatus.SOLVED
     assert jnp.all(states >= x_min - 1.0e-5)
     assert jnp.all(states <= x_max + 1.0e-5)
     assert jnp.all(controls >= u_min - 1.0e-5)
     assert jnp.all(controls <= u_max + 1.0e-5)
 
     assert int(stats.num_iter) < solver.max_iter
-    last_idx = max(int(stats.num_iter) - 1, 0)
-    primal_margin = solver.eps_abs + solver.eps_rel * float(
-        stats.primal_residual_norm_terms[last_idx]
-    )
-    dual_margin = solver.eps_abs + solver.eps_rel * float(
-        stats.dual_residual_norm_terms[last_idx]
-    )
-    assert float(stats.primal_residuals[last_idx]) <= primal_margin
-    assert float(stats.dual_residuals[last_idx]) <= dual_margin
+    assert float(stats.primal_residual) <= float(stats.primal_residual_limit)
+    assert float(stats.dual_residual) <= float(stats.dual_residual_limit)
+    assert result.iterations.linear_solver_iterations is not None
 
 
 def _assemble_full_S(S_blocks: jnp.ndarray) -> jnp.ndarray:
@@ -177,6 +182,7 @@ def test_pcg_optimal_control_matches_dense():
         ineq_blocks=jnp.zeros((N + 1, 0, nx + nu)),
         ineq_l=jnp.zeros((N + 1, 0)),
         ineq_u=jnp.zeros((N + 1, 0)),
+        slack_penalization_weight=jnp.asarray(0.0),
     )
     schur = compute_S_Phiinv(
         qp_data=qp_data,
@@ -184,6 +190,16 @@ def test_pcg_optimal_control_matches_dense():
         sigma=sigma,
         rho_ineq=rho_ineq,
     )
+    schur_direct = compute_S(
+        qp_data=qp_data,
+        rho_f=rho_f,
+        sigma=sigma,
+        rho_ineq=rho_ineq,
+    )
+    np.testing.assert_allclose(schur_direct.S, schur.S)
+    assert schur_direct.preconditioner_Phiinv is None
+    assert schur_solver_pcg.requires_preconditioner
+    assert not schur_solver_dense.requires_preconditioner
 
     zs_guess = jnp.array(0.1 * np.random.randn(N + 1, nx + nu))
     m_ineq = 3
@@ -208,6 +224,7 @@ def test_pcg_optimal_control_matches_dense():
         ineq_blocks=ineq_blocks,
         ineq_l=jnp.zeros((N + 1, m_ineq)),
         ineq_u=jnp.zeros((N + 1, m_ineq)),
+        slack_penalization_weight=jnp.asarray(0.0),
     )
     gammas = compute_gamma(
         qp_data=qp_data,

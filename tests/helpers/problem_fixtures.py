@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import numpy as np
+
 from turbompc.dynamics.drone_dynamics import (
     DroneDynamics,
     drone_parameters,
@@ -214,6 +215,8 @@ def make_linear_params(
         "reference_state_trajectory": reference_state_trajectory,
         "reference_control_trajectory": jnp.zeros((horizon + 1, nu)),
         "penalize_control_reference": False,
+        "use_slack_variables": False,
+        "slack_penalization_weight": 0.0,
         "rescale_optimization_variables": rescale,
         "constrain_initial_control": initial_control,
         "initial_control": jnp.zeros((nu,)),

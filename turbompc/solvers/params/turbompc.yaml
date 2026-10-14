@@ -1,21 +1,37 @@
 verbose: False
+constraint_handling: projection
+log_barrier_kappa: 0.0
 tol_convergence: 1.E-6
 convergence_criterion: first_order
+forward_hessian_min_eig: 1.0e-12
 num_sqp_iteration_max: 15
-linesearch: False
-linesearch_eta: 0.4
-linesearch_alphas: [0.1, 0.3, 0.7, 1.0]
+linesearch:
+  method: none
+  alphas: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  fraction_to_boundary: 0.995 # log-barrier only
+  merit:
+    armijo_coefficient: 0.4
+    penalty_min: 0.1
+    penalty_max: 1.0E6
+    constraint_norm_floor: 1.0E-8
+  filter:
+    constraint_reduction_factor: 1.E-5
+    objective_reduction_factor: 1.E-5
 admm:
   rho: 0.1
   sigma: 1.0e-6
   max_iter: 100
   eps_abs: 1.E-9
   eps_rel: 1.E-9
+  eps_prim_inf: 1.E-4
+  eps_dual_inf: 1.E-4
   rho_min: 1.0e-6
   rho_max: 1.0e6
   check_termination_every: 25
+  check_infeasibility_every: 25
   adapt_rho_every: 25
   adaptive_rho_tolerance: 5
+  rho_update_max_factor: 1.0e6
   relaxation_parameter: 1.6 # in (1, 2)
   rho_f_factor: 1000.
   pcg:

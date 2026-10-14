@@ -1,12 +1,12 @@
 """cuDSS-based sparse KKT solver via JAX FFI for backward pass optimization.
 
 The key design:
-  - rowPtr and colIdx are computed *once* from the problem shape and cached.
+  - rowPtr and colIdx are computed once from the problem shape.
   - Only the CSR `values` array changes each call; it is assembled as a pure
     JAX operation (no host callbacks, no cuSPARSE, no cudaStreamSynchronize).
-  - The FFI kernel (CudssSparseKktF32/F64) receives a pre-built CSR triple
-    (rowPtr, colIdx, values) already on device, with nnz inferred from
-    colIdx.shape[0] in C++ — eliminating the previous device→host nnz sync.
+  - A Python-owned opaque workspace keeps the device CSR structure, cuDSS
+    descriptors, and execution buffers alive. Only values and rhs enter the
+    traced FFI call.
   - A custom_vmap rule intercepts JAX's batching of solve_backward_kkt_cudss_ffi:
     instead of Nb sequential FFI calls, it assembles one block-diagonal CSR
     system of size Nb*N_kkt and issues a single cuDSS call.
@@ -14,48 +14,34 @@ The key design:
 
 from __future__ import annotations
 
-import ctypes
-from pathlib import Path
-from typing import Dict, Tuple
-
 import jax
 import jax.custom_batching
 import jax.numpy as jnp
+import numpy as np
+
 from turbompc.solvers.backward.backward_kkt_csr import (
-    BatchedKKTCSRPattern,
     KKTCSRPattern,
     assemble_batched_kkt_csr_values,
     assemble_kkt_csr_values,
     build_batched_kkt_csr_pattern,
     build_kkt_csr_pattern,
 )
+from turbompc.solvers.ffi_loader import load_ffi_lib
 from turbompc.solvers.qp_data import QPData
 from turbompc.solvers.qp_utils import ZShape, unpack_x
 
-
-def _find_lib() -> Path:
-    candidates = [
-        Path(__file__).resolve().parent.parent.parent
-        / "solvers"
-        / "csrc"
-        / "build"
-        / "libcudss_sparse_kkt_ffi.so",
-        Path(__file__).resolve().parent.parent.parent.parent
-        / "build"
-        / "ffi"
-        / "libcudss_sparse_kkt_ffi.so",
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    raise FileNotFoundError(
-        "Could not find libcudss_sparse_kkt_ffi.so. Build first:\n"
-        "  cmake -S turbompc/solvers/csrc -B build/ffi -DCMAKE_BUILD_TYPE=Release\n"
-        "  cmake --build build/ffi -j\n"
-    )
-
-
-_LIB = ctypes.cdll.LoadLibrary(str(_find_lib()))
+_LIB_NAME = "libcudss_sparse_kkt_ffi.so"
+_LIB = load_ffi_lib(_LIB_NAME)
+jax.ffi.register_ffi_target(
+    "cudss_sparse_kkt_workspace_destroy",
+    jax.ffi.pycapsule(_LIB.TurboMpcDestroyCudssSparseKktWorkspace),
+    platform="CUDA",
+)
+jax.ffi.register_ffi_target(
+    "cudss_sparse_kkt_probe",
+    jax.ffi.pycapsule(_LIB.CudssSparseKktProbe),
+    platform="CUDA",
+)
 
 jax.ffi.register_ffi_target(
     "cudss_sparse_kkt_f32",
@@ -67,139 +53,172 @@ jax.ffi.register_ffi_target(
     jax.ffi.pycapsule(_LIB.CudssSparseKktF64),
     platform="CUDA",
 )
-# Dense-input targets kept registered (unused by default, available for testing)
 jax.ffi.register_ffi_target(
-    "cudss_sparse_kkt_dense_f32",
-    jax.ffi.pycapsule(_LIB.CudssSparseKktDenseF32),
-    platform="CUDA",
-)
-jax.ffi.register_ffi_target(
-    "cudss_sparse_kkt_dense_f64",
-    jax.ffi.pycapsule(_LIB.CudssSparseKktDenseF64),
+    "cudss_sparse_kkt_workspace_create",
+    jax.ffi.pycapsule(_LIB.TurboMpcCreateCudssSparseKktWorkspace),
     platform="CUDA",
 )
 
-# ---------------------------------------------------------------------------
-# Analysis-cache control (ctypes, NOT FFI — side-effecting cleanup/diagnostics,
-# not part of the traced graph). The C++ cuDSS symbolic-analysis cache is keyed
-# by (n, nnz, dtype) and otherwise lives for the process lifetime.
-# ---------------------------------------------------------------------------
-_LIB.ClearCudssAnalysisCacheImpl.restype = None
-_LIB.CudssAnalysisCacheSize.restype = ctypes.c_int
-_LIB.CudssProbeDeviceBytesImpl.restype = ctypes.c_int
-_LIB.CudssProbeDeviceBytesImpl.argtypes = [
-    ctypes.POINTER(ctypes.c_int32),  # rowPtr_host (n+1)
-    ctypes.POINTER(ctypes.c_int32),  # colIdx_host (nnz)
-    ctypes.c_int32,  # n
-    ctypes.c_int32,  # nnz
-    ctypes.c_int,  # is_double
-    ctypes.POINTER(ctypes.c_int64),  # out[2]
-]
 
-
-def _probe_cudss_device_bytes(pattern) -> Tuple[int, int]:
-    """Eagerly run single-block cuDSS PHASE_ANALYSIS for `pattern` and return
-    (per_block_device_bytes, free_device_bytes). (0, 0) on probe failure.
-
-    Side-effecting, runs OUTSIDE the traced graph (raw ctypes, not a JAX op).
-    Called once per shape from `_safe_cudss_chunk` and cached there.
-
-    Retries once on a (0,0)/error result to absorb a cold-CUDA-context
-    first-call flake.
-    """
-    import numpy as _np
-
-    rowPtr = _np.ascontiguousarray(pattern.rowPtr, dtype=_np.int32)
-    colIdx = _np.ascontiguousarray(pattern.colIdx, dtype=_np.int32)
-    n = ctypes.c_int32(int(pattern.N_kkt))
-    nnz = ctypes.c_int32(int(pattern.nnz))
+def _probe_cudss_device_bytes(pattern) -> tuple[int, int]:
+    """Return a cuDSS memory estimate and the available JAX allocator budget."""
     for _ in range(2):
-        out = (ctypes.c_int64 * 2)()
-        rc = _LIB.CudssProbeDeviceBytesImpl(
-            rowPtr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
-            colIdx.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
-            n,
-            nnz,
-            ctypes.c_int(1),  # f64 (backward solve is float64)
-            out,
-        )
-        if rc == 0 and int(out[0]) > 0:
-            return (int(out[0]), int(out[1]))
+        workspace = None
+        try:
+            with jax.ensure_compile_time_eval():
+                workspace = CudssSparseKktWorkspace(pattern, np.float64)
+                with jax.default_device(workspace._device):
+                    out = jax.ffi.ffi_call(
+                        "cudss_sparse_kkt_probe",
+                        jax.ShapeDtypeStruct((4,), np.uint32),
+                        has_side_effect=True,
+                    )(workspace_handle=np.int64(workspace.handle))
+                    # Transport two 64-bit counters without requiring JAX x64.
+                    estimate, driver_free = map(int, np.asarray(out).view(np.int64))
+                device = workspace._device
+                workspace.close()
+                workspace = None
+                stats = device.memory_stats() or {}
+                bytes_in_use = int(stats.get("bytes_in_use", 0))
+                pool_free = max(0, int(stats.get("bytes_reserved", 0)) - bytes_in_use)
+                # XLA can use both unreserved driver memory and free memory in
+                # JAX's pool. Cap that total by the allocator's own limit.
+                free = driver_free + pool_free
+                if (bytes_limit := stats.get("bytes_limit")) is not None:
+                    free = min(free, max(0, int(bytes_limit) - bytes_in_use))
+                if estimate > 0:
+                    return estimate, free
+        except RuntimeError:
+            pass
+        finally:
+            if workspace is not None:
+                workspace.close()
     return (0, 0)
 
 
-def clear_analysis_cache() -> None:
-    """Free all cached cuDSS symbolic-analysis objects (one per sparsity
-    pattern: (n, nnz, dtype)).
+class CudssSparseKktWorkspace:
+    """Own one native cuDSS workspace and its CSR structure."""
 
-    The cache speeds up repeated solves of the same problem shape but is never
-    evicted, so a long-lived process that solves many distinct shapes
-    (interactive sessions, shape-sweeping training) accumulates GPU memory.
-    Call this to release it. (The per-config sweep is unaffected — each config
-    is a fresh process with a single fixed shape.)
-    """
-    _LIB.ClearCudssAnalysisCacheImpl()
+    def __init__(self, pattern, dtype) -> None:
+        self._handle = 0
+        self._device = jax.config.jax_default_device
+        if getattr(self._device, "platform", None) != "gpu":
+            self._device = jax.local_devices(backend="gpu")[0]
+        row_ptr = np.ascontiguousarray(pattern.rowPtr, dtype=np.int32)
+        col_idx = np.ascontiguousarray(pattern.colIdx, dtype=np.int32)
+        self.n = int(pattern.N_kkt)
+        self.nnz = int(pattern.nnz)
+        self.dtype = jnp.dtype(dtype)
+        if self.dtype not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.float64)):
+            raise TypeError("sparse KKT workspace dtype must be float32 or float64")
+        dtype_bytes = self.dtype.itemsize
+        with jax.ensure_compile_time_eval(), jax.default_device(self._device):
+            result = jax.ffi.ffi_call(
+                "cudss_sparse_kkt_workspace_create",
+                jax.ShapeDtypeStruct((2,), np.uint32),
+                has_side_effect=True,
+            )(row_ptr=row_ptr, col_idx=col_idx, dtype_bytes=np.int64(dtype_bytes))
+            result.block_until_ready()
+            self._handle = int(np.asarray(result).view(np.uint64).item())
+
+    @property
+    def handle(self) -> int:
+        if self._handle == 0:
+            raise RuntimeError("sparse KKT workspace is closed")
+        return self._handle
+
+    def close(self) -> None:
+        if self._handle == 0:
+            return
+        with jax.ensure_compile_time_eval(), jax.default_device(self._device):
+            result = jax.ffi.ffi_call(
+                "cudss_sparse_kkt_workspace_destroy",
+                jax.ShapeDtypeStruct((), np.uint32),
+                has_side_effect=True,
+            )(workspace_handle=np.int64(self.handle))
+            result.block_until_ready()
+        self._handle = 0
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001, S110
+            pass
 
 
-def analysis_cache_size() -> int:
-    """Live number of cached cuDSS analysis objects (debug/test helper)."""
-    return int(_LIB.CudssAnalysisCacheSize())
+@jax.tree_util.register_pytree_node_class
+class CudssBackwardKktSolver:
+    """Python owner for all native KKT workspaces used by one MPC solver."""
 
+    def __init__(self) -> None:
+        self._workspaces = {}
+        self._patterns = {}
+        self._batched_patterns = {}
+        self._safe_chunks = {}
 
-# ---------------------------------------------------------------------------
-# Pattern caches
-# ---------------------------------------------------------------------------
+    def tree_flatten(self):
+        return (), self
 
-# Single-problem cache: (N, n, m0, m, m_g) → KKTCSRPattern (numpy only, no JAX arrays)
-_PATTERN_CACHE: Dict[Tuple[int, int, int, int, int], KKTCSRPattern] = {}
+    @classmethod
+    def tree_unflatten(cls, owner, children):
+        del children
+        return owner
 
-# Batched cache: (Nb, N, n, m0, m, m_g) → BatchedKKTCSRPattern (numpy only, no JAX arrays)
-_BATCHED_PATTERN_CACHE: Dict[
-    Tuple[int, int, int, int, int, int], BatchedKKTCSRPattern
-] = {}
+    def workspace(self, pattern, dtype) -> CudssSparseKktWorkspace:
+        key = (int(pattern.N_kkt), int(pattern.nnz), jnp.dtype(dtype))
+        workspace = self._workspaces.get(key)
+        if workspace is None:
+            workspace = CudssSparseKktWorkspace(pattern, dtype)
+            self._workspaces[key] = workspace
+        return workspace
+
+    def pattern(self, N: int, n: int, m0: int, m: int, m_g: int):
+        key = (N, n, m0, m, m_g)
+        pattern = self._patterns.get(key)
+        if pattern is None:
+            pattern = build_kkt_csr_pattern(*key)
+            self._patterns[key] = pattern
+        return pattern
+
+    def batched_pattern(
+        self, batch_size: int, N: int, n: int, m0: int, m: int, m_g: int
+    ):
+        key = (batch_size, N, n, m0, m, m_g)
+        pattern = self._batched_patterns.get(key)
+        if pattern is None:
+            pattern = build_batched_kkt_csr_pattern(
+                batch_size, self.pattern(N, n, m0, m, m_g)
+            )
+            self._batched_patterns[key] = pattern
+        return pattern
+
+    def safe_chunk(self, N: int, n: int, m0: int, m: int, m_g: int) -> int:
+        key = (N, n, m0, m, m_g)
+        chunk = self._safe_chunks.get(key)
+        if chunk is None:
+            chunk = _safe_cudss_chunk(*key)
+            self._safe_chunks[key] = chunk
+        return chunk
+
+    def solve(self, qp_data: QPData, zshape: ZShape):
+        return solve_backward_kkt_cudss_ffi(qp_data, zshape, self)
+
+    def close(self) -> None:
+        workspaces = self._workspaces
+        self._workspaces = {}
+        for workspace in workspaces.values():
+            workspace.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001, S110
+            pass
 
 
 def _single_pattern(N: int, n: int, m0: int, m: int, m_g: int) -> KKTCSRPattern:
-    """Cached single-problem CSR pattern (numpy only — no device copy)."""
-    key = (N, n, m0, m, m_g)
-    if key not in _PATTERN_CACHE:
-        _PATTERN_CACHE[key] = build_kkt_csr_pattern(N, n, m0, m, m_g)
-    return _PATTERN_CACHE[key]
-
-
-def _get_or_build_pattern(
-    N: int, n: int, m0: int, m: int, m_g: int
-) -> Tuple[jax.Array, jax.Array, KKTCSRPattern]:
-    """Return (rowPtr_dev, colIdx_dev, pattern), building pattern on first call.
-
-    The numpy pattern is cached; jnp.asarray() is called fresh each time so that
-    no JAX tracer ever escapes its transformation scope into the global cache.
-    """
-    key = (N, n, m0, m, m_g)
-    if key not in _PATTERN_CACHE:
-        _PATTERN_CACHE[key] = build_kkt_csr_pattern(N, n, m0, m, m_g)
-    pat = _PATTERN_CACHE[key]
-    return jnp.asarray(pat.rowPtr), jnp.asarray(pat.colIdx), pat
-
-
-def _get_or_build_batched_pattern(
-    Nb: int, N: int, n: int, m0: int, m: int, m_g: int
-) -> Tuple[jax.Array, jax.Array, BatchedKKTCSRPattern]:
-    """Return (rowPtr_dev, colIdx_dev, batched_pattern), building on first call.
-
-    The numpy pattern is cached; jnp.asarray() is called fresh each time so that
-    no JAX tracer ever escapes its transformation scope into the global cache.
-    """
-    key = (Nb, N, n, m0, m, m_g)
-    if key not in _BATCHED_PATTERN_CACHE:
-        # Reuse (or build) the single-problem pattern, then build the batched one.
-        single_key = (N, n, m0, m, m_g)
-        if single_key not in _PATTERN_CACHE:
-            _PATTERN_CACHE[single_key] = build_kkt_csr_pattern(N, n, m0, m, m_g)
-        single = _PATTERN_CACHE[single_key]
-        _BATCHED_PATTERN_CACHE[key] = build_batched_kkt_csr_pattern(Nb, single)
-    bat = _BATCHED_PATTERN_CACHE[key]
-    return jnp.asarray(bat.rowPtr), jnp.asarray(bat.colIdx), bat
+    """Build one host CSR pattern for memory probing."""
+    return build_kkt_csr_pattern(N, n, m0, m, m_g)
 
 
 # ---------------------------------------------------------------------------
@@ -208,20 +227,24 @@ def _get_or_build_batched_pattern(
 
 
 def _call_ffi(
-    rowPtr_dev: jax.Array,
-    colIdx_dev: jax.Array,
     values: jax.Array,
     rhs: jax.Array,
-    N_kkt: int,
-    dtype,
+    workspace: CudssSparseKktWorkspace,
 ) -> jax.Array:
     """Issue a single cuDSS FFI call. Returns solution vector of length N_kkt."""
+    dtype = workspace.dtype
     ffi_target = (
         "cudss_sparse_kkt_f64" if dtype == jnp.float64 else "cudss_sparse_kkt_f32"
     )
-    sol_shape = jax.ShapeDtypeStruct((N_kkt,), dtype)
+    sol_shape = jax.ShapeDtypeStruct((workspace.n,), dtype)
     call = jax.ffi.ffi_call(ffi_target, sol_shape, vmap_method="sequential")
-    return call(rowPtr_dev, colIdx_dev, values, rhs)
+    return call(
+        values,
+        rhs,
+        n=workspace.n,
+        nnz=workspace.nnz,
+        workspace_handle=workspace.handle,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +256,8 @@ def _call_ffi(
 def solve_backward_kkt_cudss_ffi(
     qp_data: QPData,
     zshape: ZShape,
-) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
+    solver: CudssBackwardKktSolver,
+) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Solve the backward-pass KKT system using cuDSS sparse FFI.
 
     When called under jax.vmap (e.g. from the SQP backward pass), the
@@ -261,13 +285,13 @@ def solve_backward_kkt_cudss_ffi(
     m_g = G.shape[1]
     dtype = D.dtype
 
-    rowPtr_dev, colIdx_dev, pattern = _get_or_build_pattern(N, n, m0, m, m_g)
+    pattern = solver.pattern(N, n, m0, m, m_g)
     values = assemble_kkt_csr_values(D, E, A0, A_minus, A_plus, G, pattern)
 
     q_flat = qp_data.cost.q.reshape(-1)
     rhs = jnp.concatenate([-q_flat, jnp.zeros(pattern.m_total, dtype=dtype)])
 
-    solution = _call_ffi(rowPtr_dev, colIdx_dev, values, rhs, pattern.N_kkt, dtype)
+    solution = _call_ffi(values, rhs, solver.workspace(pattern, dtype))
 
     n_total = pattern.n_total
     x_blocks = solution[:n_total].reshape(N + 1, n)
@@ -297,10 +321,6 @@ def solve_backward_kkt_cudss_ffi(
 # (cuDSS supplies the per-shape number).
 _CUDSS_BUDGET_SAFETY = 0.8
 
-# (N, n, m0, m, m_g) -> calibrated static chunk.  Mirrors _PATTERN_CACHE:
-# numpy/int only, no JAX arrays, computed once per shape.
-_SAFE_CHUNK_CACHE: Dict[Tuple[int, int, int, int, int], int] = {}
-
 
 def _safe_cudss_chunk(N: int, n: int, m0: int, m: int, m_g: int) -> int:
     """Largest block-diagonal chunk that provably fits cuDSS device memory.
@@ -310,24 +330,20 @@ def _safe_cudss_chunk(N: int, n: int, m0: int, m: int, m_g: int) -> int:
     chunk = max(1, floor(free*safety / M_block)).  Cached.  Probe failure
     (or zero estimate) => conservative chunk = 1 (one independent block per
     cuDSS call: provably safe, just slower).  Called once per shape from the
-    chunked vmap path; the probe is eager (raw ctypes), never in the graph.
+    chunked vmap path; the probe executes eagerly through FFI,
+    outside the solve graph.
     """
-    key = (N, n, m0, m, m_g)
-    cached = _SAFE_CHUNK_CACHE.get(key)
-    if cached is not None:
-        return cached
     pattern = _single_pattern(N, n, m0, m, m_g)
     m_block, free_bytes = _probe_cudss_device_bytes(pattern)
     if m_block <= 0 or free_bytes <= 0:
         chunk = 1
     else:
         chunk = max(1, int(free_bytes * _CUDSS_BUDGET_SAFETY) // m_block)
-    _SAFE_CHUNK_CACHE[key] = chunk
     return chunk
 
 
 @solve_backward_kkt_cudss_ffi.def_vmap
-def _solve_backward_kkt_cudss_ffi_vmap(axis_size, in_batched, qp_data, zshape):
+def _solve_backward_kkt_cudss_ffi_vmap(axis_size, in_batched, qp_data, zshape, solver):
     """Custom vmap rule: assemble Nb problems as one block-diagonal system.
 
     Called by JAX when solve_backward_kkt_cudss_ffi is inside a jax.vmap.
@@ -363,10 +379,12 @@ def _solve_backward_kkt_cudss_ffi_vmap(axis_size, in_batched, qp_data, zshape):
     m_g = G.shape[-2] if G.ndim == 4 else G.shape[1]
     dtype = D.dtype
 
-    if Nb > _safe_cudss_chunk(N, n, m0, m, m_g):
-        return _solve_backward_kkt_chunked(axis_size, in_batched, qp_data, zshape)
+    if Nb > solver.safe_chunk(N, n, m0, m, m_g):
+        return _solve_backward_kkt_chunked(
+            axis_size, in_batched, qp_data, zshape, solver
+        )
 
-    rowPtr_dev, colIdx_dev, bat = _get_or_build_batched_pattern(Nb, N, n, m0, m, m_g)
+    bat = solver.batched_pattern(Nb, N, n, m0, m, m_g)
     values = assemble_batched_kkt_csr_values(D, E, A0, A_minus, A_plus, G, bat)
 
     # Build batched RHS: concatenate [-q_i; 0_i] for all i → (Nb * N_kkt,)
@@ -380,7 +398,7 @@ def _solve_backward_kkt_cudss_ffi_vmap(axis_size, in_batched, qp_data, zshape):
     rhs_batched = jnp.concatenate([-q_flat, zeros_dual], axis=1)  # (Nb, N_kkt)
     rhs = rhs_batched.ravel()  # (Nb * N_kkt,)
 
-    solution = _call_ffi(rowPtr_dev, colIdx_dev, values, rhs, bat.N_kkt_total, dtype)
+    solution = _call_ffi(values, rhs, solver.workspace(bat, dtype))
 
     # Unpack: split into Nb solutions
     N_kkt = bat.single.N_kkt
@@ -401,7 +419,7 @@ def _solve_backward_kkt_cudss_ffi_vmap(axis_size, in_batched, qp_data, zshape):
     return out, out_batched
 
 
-def _solve_backward_kkt_chunked(axis_size, in_batched, qp_data, zshape):
+def _solve_backward_kkt_chunked(axis_size, in_batched, qp_data, zshape, solver):
     """Split a large batch into chunks, solve each as one block-diagonal
     cuDSS call, concatenate.  Numerically exact (blocks are independent).
 
@@ -430,7 +448,7 @@ def _solve_backward_kkt_chunked(axis_size, in_batched, qp_data, zshape):
     m = A_minus.shape[-2] if A_minus.ndim == 4 else A_minus.shape[1]
     m_g = G.shape[-2] if G.ndim == 4 else G.shape[1]
 
-    chunk = _safe_cudss_chunk(N, n, m0, m, m_g)
+    chunk = solver.safe_chunk(N, n, m0, m, m_g)
     Nb = axis_size
     n_chunks = (Nb + chunk - 1) // chunk
     padded = n_chunks * chunk
@@ -455,7 +473,7 @@ def _solve_backward_kkt_chunked(axis_size, in_batched, qp_data, zshape):
         new_leaves = [next(it) if is_b else x for x, is_b in zip(leaves, flags)]
         qp_chunk = jax.tree.unflatten(treedef, new_leaves)
         out_chunk, _ = _solve_backward_kkt_cudss_ffi_vmap(
-            chunk, in_batched, qp_chunk, zshape
+            chunk, in_batched, qp_chunk, zshape, solver
         )
         (xs_, ys_), ms_ = out_chunk
         return xs_, ys_, ms_

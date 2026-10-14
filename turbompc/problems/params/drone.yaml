@@ -44,7 +44,7 @@ control_rescaling_min: [-1., -1, -1]
 control_rescaling_max: [1., 1., 1.]
 
 # dictionary of parameters for the state_dot function of the dynamics
-# (key=string, value=jnp.array((horizon, parameter_size)))
 # where each key is an argument of the function state_dot of the dynamics
-dynamics_state_dot_params: null
-# nominal_dynamics_state_dot_params: null
+dynamics_state_dot_params:
+  mass: [32.0]
+  drag_coefficient: [0.2]

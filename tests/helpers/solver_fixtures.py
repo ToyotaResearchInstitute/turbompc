@@ -1,4 +1,58 @@
+import jax.numpy as jnp
+
+from turbompc.solvers.qp_data import (
+    QPCostBlocks,
+    QPData,
+    QPEqualityBlocks,
+    QPInequalityBlocks,
+)
 from turbompc.utils.load_params import load_solver_params
+
+
+def make_tiny_qp(*, q, initial_rhs=0.0, hessian=None):
+    """Build a two-stage scalar QP for solver-status tests."""
+    dtype = q.dtype
+    if hessian is None:
+        hessian = jnp.zeros((2, 1, 1), dtype=dtype)
+    return QPData(
+        cost=QPCostBlocks(
+            D=hessian,
+            E=jnp.zeros((1, 1, 1), dtype=dtype),
+            q=q,
+        ),
+        eq=QPEqualityBlocks(
+            A0=jnp.zeros((1, 1), dtype=dtype),
+            A_minus=jnp.zeros((1, 1, 1), dtype=dtype),
+            A_plus=jnp.zeros((1, 1, 1), dtype=dtype),
+            c0=jnp.asarray([initial_rhs], dtype=dtype),
+            c=jnp.zeros((1, 1), dtype=dtype),
+        ),
+        ineq=QPInequalityBlocks(
+            G=jnp.zeros((2, 1, 1), dtype=dtype),
+            l=jnp.full((2, 1), -jnp.inf, dtype=dtype),
+            u=jnp.full((2, 1), jnp.inf, dtype=dtype),
+            slack_penalization_weight=jnp.asarray(0.0, dtype=dtype),
+        ),
+    )
+
+
+def build_gauss_newton_qp(solver, states, controls, problem_params):
+    """Build an ordinary forward QP through TurboMPC's shared builder."""
+    from turbompc.solvers.turbompc_solver import HessianApproximation
+
+    slacks = jnp.zeros(
+        (states.shape[0], solver.program.num_inequality_constraints),
+        dtype=states.dtype,
+    )
+    return solver._build_qp(
+        states,
+        controls,
+        slacks,
+        problem_params,
+        None,
+        hessian=HessianApproximation.GAUSS_NEWTON,
+        scale_variables=True,
+    )
 
 
 def sqp_params(
@@ -68,8 +122,10 @@ def load_drone_solver_params():
     solver2_params = load_solver_params("turbompc.yaml")
     solver2_params["num_sqp_iteration_max"] = solver_params["num_sqp_iteration_max"]
     solver2_params["tol_convergence"] = solver_params["tol_convergence"]
-    solver2_params["linesearch"] = solver_params["linesearch"]
-    solver2_params["linesearch_alphas"] = solver_params["linesearch_alphas"]
+    solver2_params["linesearch"]["method"] = (
+        "merit" if solver_params["linesearch"] else "none"
+    )
+    solver2_params["linesearch"]["alphas"] = solver_params["linesearch_alphas"]
 
     solver2_params["admm"]["max_iter"] = solver_params["osqp"]["max_iter"]
     solver2_params["admm"]["eps_abs"] = solver_params["osqp"]["eps_abs"]

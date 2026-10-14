@@ -12,15 +12,22 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
+import numpy as np
 import pytest
-from turbompc.dynamics.spacecraft_dynamics import SpacecraftDynamics
-from turbompc.problems.optimal_control_problem import (
-    OptimalControlProblem,
-    OptimalControlProblemSlack,
+
+from tests.helpers.constraint_handling_fixtures import (
+    handlings,
+    linear_problem,
+    obstacle_problem,
+    with_handling,
 )
+from turbompc.dynamics.spacecraft_dynamics import SpacecraftDynamics
+from turbompc.problems.optimal_control_problem import OptimalControlProblem
+from turbompc.solvers.status import SQPStatus
 from turbompc.solvers.turbompc_solver import (
     BackwardBackend,
     ForwardBackend,
+    HessianApproximation,
     TurboMPCSolver,
 )
 from turbompc.utils.load_params import load_solver_params
@@ -74,45 +81,59 @@ def _base_spacecraft_params(
     return params
 
 
-def _tight_solver_params() -> Dict[str, Any]:
+def _tight_solver_params(
+    log_barrier_kappa: float = 0.0, linesearch: str = "none"
+) -> Dict[str, Any]:
+    # The dense Schur solve lets ADMM reach residuals of ~1e-11. The SQP error
+    # floor scales with the multipliers (~3e-10 with large slacks), so tighter
+    # SQP tolerances only exhaust the iteration limit.
     sp = load_solver_params("turbompc.yaml")
-    sp["num_sqp_iteration_max"] = 30
-    sp["tol_convergence"] = 1e-12
-    sp["linesearch"] = False
+    sp["num_sqp_iteration_max"] = 60
+    sp["tol_convergence"] = 1e-9
+    sp["linesearch"]["method"] = linesearch
     sp["warm_start_backward"] = True
     sp["admm"]["max_iter"] = 5000
     sp["admm"]["eps_abs"] = 1e-10
     sp["admm"]["eps_rel"] = 1e-10
     sp["admm"]["check_termination_every"] = 1
-    sp["admm"]["pcg"]["max_iter"] = 500
-    sp["admm"]["pcg"]["tol_epsilon"] = 1e-18
-    return sp
+    return with_handling(sp, log_barrier_kappa)
+
+
+def _turbompc_solver(
+    problem,
+    *,
+    use_full_hessian: bool,
+    log_barrier_kappa: float = 0.0,
+    linesearch: str = "none",
+) -> TurboMPCSolver:
+    # The problems here are small, so a dense Schur solve is exact and fast.
+    return TurboMPCSolver(
+        program=problem,
+        params=_tight_solver_params(log_barrier_kappa, linesearch),
+        forward_backend=ForwardBackend.ADMM_JAX_LOOP_JAX_DENSE,
+        backward_backend=BackwardBackend.DIRECT_JAX_DENSE,
+        backward_hessian=(
+            HessianApproximation.FULL_HESSIAN
+            if use_full_hessian
+            else HessianApproximation.GAUSS_NEWTON
+        ),
+    )
 
 
 def _make_solver(
     *,
     use_slack: bool,
-    use_full_hessian: bool,
     bounded: bool = True,
     horizon: int = 6,
     rescale: bool = False,
 ):
+    # The spacecraft dynamics are nonlinear, so only the full-Hessian backward
+    # pass is the exact gradient that finite differences can check tightly.
     params = _base_spacecraft_params(
         horizon=horizon, use_slack=use_slack, bounded=bounded, rescale=rescale
     )
-    dynamics = SpacecraftDynamics()
-    if use_slack:
-        problem = OptimalControlProblemSlack(dynamics=dynamics, params=params)
-    else:
-        problem = OptimalControlProblem(dynamics=dynamics, params=params)
-    solver = TurboMPCSolver(
-        program=problem,
-        params=_tight_solver_params(),
-        forward_backend=ForwardBackend.ADMM_JAX_LOOP_PCG,
-        backward_backend=BackwardBackend.DIRECT_JAX_DENSE,
-        use_full_hessian=use_full_hessian,
-    )
-    return solver, params
+    problem = OptimalControlProblem(dynamics=SpacecraftDynamics(), params=params)
+    return _turbompc_solver(problem, use_full_hessian=True), params
 
 
 def _fd_grad_scalar_at_leaf(
@@ -158,9 +179,9 @@ def _compare_grad(
     objective_fn,
     weights: Dict[str, Any],
     grad_ad: Dict[str, Any],
-    eps: float = 1e-5,
-    rel_tol: float = 1e-2,
-    abs_tol: float = 1e-7,
+    eps: float = 1e-4,
+    rel_tol: float = 1e-5,
+    abs_tol: float = 1e-9,
     include_paths: list[tuple] | None = None,
     flat_indices_by_path: Dict[tuple, list[int]] | None = None,
 ) -> Dict[str, float]:
@@ -216,6 +237,8 @@ def _compare_grad(
 
 def _objective_from_solver(solver, params):
     guess = solver.initial_guess(params)
+    # Gradients of an unconverged solve are not the implicit-function gradients.
+    assert int(solver.solve(guess, params).status) == int(SQPStatus.SOLVED)
 
     def objective(weights):
         sol = solver.solve(guess, params, weights)
@@ -226,8 +249,7 @@ def _objective_from_solver(solver, params):
 
 
 @pytest.mark.extended
-@pytest.mark.parametrize("use_full_hessian", [False, True])
-def test_slack_weight_grad_direct(use_full_hessian):
+def test_slack_weight_grad_direct():
     # Tight bounds => slack active.
     horizon = 5
     params = _base_spacecraft_params(horizon=horizon, use_slack=True, bounded=True)
@@ -236,15 +258,8 @@ def test_slack_weight_grad_direct(use_full_hessian):
     params["state_max_bounds"] = jnp.full(3, bound, dtype=jnp.float64)
     params["initial_state"] = jnp.array([0.1, -0.15, 0.08], dtype=jnp.float64)
 
-    dynamics = SpacecraftDynamics()
-    problem = OptimalControlProblemSlack(dynamics=dynamics, params=params)
-    solver = TurboMPCSolver(
-        program=problem,
-        params=_tight_solver_params(),
-        forward_backend=ForwardBackend.ADMM_JAX_LOOP_PCG,
-        backward_backend=BackwardBackend.DIRECT_JAX_DENSE,
-        use_full_hessian=use_full_hessian,
-    )
+    problem = OptimalControlProblem(dynamics=SpacecraftDynamics(), params=params)
+    solver = _turbompc_solver(problem, use_full_hessian=True)
     objective = _objective_from_solver(solver, params)
 
     weights = {
@@ -255,13 +270,7 @@ def test_slack_weight_grad_direct(use_full_hessian):
     }
 
     grad_ad = jax.grad(objective)(weights)
-    results = _compare_grad(
-        objective,
-        weights,
-        grad_ad,
-        eps=1e-4,
-        rel_tol=1e-2,
-    )
+    results = _compare_grad(objective, weights, grad_ad)
     assert results["slack_penalization_weight"] < 1.0, results
 
 
@@ -273,7 +282,6 @@ def _make_slack_solver(
     *,
     initial_state,
     state_bound: float,
-    use_full_hessian: bool,
     horizon: int = 5,
     control_bound: float = 1e3,
 ):
@@ -291,16 +299,8 @@ def _make_slack_solver(
     params["control_min_bounds"] = jnp.full(3, -control_bound, dtype=jnp.float64)
     params["control_max_bounds"] = jnp.full(3, control_bound, dtype=jnp.float64)
     params["initial_state"] = jnp.asarray(initial_state, dtype=jnp.float64)
-    dynamics = SpacecraftDynamics()
-    problem = OptimalControlProblemSlack(dynamics=dynamics, params=params)
-    solver = TurboMPCSolver(
-        program=problem,
-        params=_tight_solver_params(),
-        forward_backend=ForwardBackend.ADMM_JAX_LOOP_PCG,
-        backward_backend=BackwardBackend.DIRECT_JAX_DENSE,
-        use_full_hessian=use_full_hessian,
-    )
-    return solver, params
+    problem = OptimalControlProblem(dynamics=SpacecraftDynamics(), params=params)
+    return _turbompc_solver(problem, use_full_hessian=True), params
 
 
 def _classify_active_set(sol) -> tuple[int, int]:
@@ -342,79 +342,45 @@ def _slack_grad_check(
         ),
     }
     grad_ad = jax.grad(objective)(weights)
-    # The lower-only setup is sensitive to SQP/ADMM warm-start state from the
-    # active-set sanity solve above; a wider central-difference step avoids the
-    # local solver noise without changing the checked active set.
-    eps = 1e-2 if expect_lower and not expect_upper else 1e-3
     results = _compare_grad(
         objective,
         weights,
         grad_ad,
-        eps=eps,
-        rel_tol=1e-2,
-        abs_tol=1e-7,
         include_paths=[("slack_penalization_weight",)],
     )
     assert results["slack_penalization_weight"] < 1.0, results
 
 
-@pytest.mark.parametrize("use_full_hessian", [False, True])
-def test_slack_grad_lower_active_only(use_full_hessian):
+def test_slack_grad_lower_active_only():
     solver, params = _make_slack_solver(
-        initial_state=(-0.15, -0.15, -0.15),
-        state_bound=0.1,
-        use_full_hessian=use_full_hessian,
+        initial_state=(-0.15, -0.15, -0.15), state_bound=0.1
     )
     _slack_grad_check(
-        solver,
-        params,
-        expect_lower=True,
-        expect_upper=False,
-        label=f"slack lower-only fh={use_full_hessian}",
+        solver, params, expect_lower=True, expect_upper=False, label="slack lower-only"
     )
 
 
-@pytest.mark.parametrize("use_full_hessian", [False, True])
-def test_slack_grad_upper_active_only(use_full_hessian):
+def test_slack_grad_upper_active_only():
     solver, params = _make_slack_solver(
-        initial_state=(0.15, 0.15, 0.15),
-        state_bound=0.1,
-        use_full_hessian=use_full_hessian,
+        initial_state=(0.15, 0.15, 0.15), state_bound=0.1
     )
     _slack_grad_check(
-        solver,
-        params,
-        expect_lower=False,
-        expect_upper=True,
-        label=f"slack upper-only fh={use_full_hessian}",
+        solver, params, expect_lower=False, expect_upper=True, label="slack upper-only"
     )
 
 
-@pytest.mark.parametrize("use_full_hessian", [False, True])
-def test_slack_grad_mixed_active(use_full_hessian):
+def test_slack_grad_mixed_active():
     solver, params = _make_slack_solver(
-        initial_state=(0.15, -0.15, 0.15),
-        state_bound=0.1,
-        use_full_hessian=use_full_hessian,
+        initial_state=(0.15, -0.15, 0.15), state_bound=0.1
     )
     _slack_grad_check(
-        solver,
-        params,
-        expect_lower=True,
-        expect_upper=True,
-        label=f"slack mixed fh={use_full_hessian}",
+        solver, params, expect_lower=True, expect_upper=True, label="slack mixed"
     )
 
 
 def test_linear_terminal_cost_grad_full_hessian_rescaled():
-    use_full_hessian = True
-    rescale = True
     solver, params = _make_solver(
-        use_slack=False,
-        use_full_hessian=use_full_hessian,
-        bounded=False,
-        horizon=5,
-        rescale=rescale,
+        use_slack=False, bounded=False, horizon=5, rescale=True
     )
     objective = _objective_from_solver(solver, params)
 
@@ -425,26 +391,13 @@ def test_linear_terminal_cost_grad_full_hessian_rescaled():
     }
 
     grad_ad = jax.grad(objective)(weights)
-    results = _compare_grad(
-        objective,
-        weights,
-        grad_ad,
-        eps=1e-5,
-        rel_tol=1e-2,
-    )
-    assert results["weights_linear_penalization_final_state"] < 1.0
+    results = _compare_grad(objective, weights, grad_ad)
+    assert results["weights_linear_penalization_final_state"] < 1.0, results
 
 
 def test_dynamics_state_dot_params_grad_full_hessian_rescaled():
-    use_full_hessian = True
-    rescale = True
-    horizon = 5
     solver, params = _make_solver(
-        use_slack=False,
-        use_full_hessian=use_full_hessian,
-        bounded=False,
-        horizon=horizon,
-        rescale=rescale,
+        use_slack=False, bounded=False, horizon=5, rescale=True
     )
     objective = _objective_from_solver(solver, params)
 
@@ -457,13 +410,10 @@ def test_dynamics_state_dot_params_grad_full_hessian_rescaled():
     }
 
     grad_ad = jax.grad(objective)(weights)
-    rel_tol = 2e-2 if use_full_hessian else 5e-2
     results = _compare_grad(
         objective,
         weights,
         grad_ad,
-        eps=1e-5,
-        rel_tol=rel_tol,
         include_paths=[("dynamics_state_dot_params", "inertia_vector")],
         flat_indices_by_path={
             ("dynamics_state_dot_params", "inertia_vector"): [
@@ -473,22 +423,20 @@ def test_dynamics_state_dot_params_grad_full_hessian_rescaled():
             ],
         },
     )
-    assert results["dynamics_state_dot_params.inertia_vector"] < 1.0
+    assert results["dynamics_state_dot_params.inertia_vector"] < 1.0, results
 
 
 @pytest.mark.extended
 def test_combined_slack_full_hessian_multi_weight():
-    """Exercise slack + full_hessian + multiple array weights together."""
-    solver, params = _make_solver(
-        use_slack=True,
-        use_full_hessian=True,
-        bounded=True,
-        horizon=5,
-    )
+    """Exercise slack + full_hessian + multiple array weights together.
+
+    The slack is inactive here, so ``slack_penalization_weight`` has a zero
+    gradient; the slack_grad_* tests cover it with active slacks.
+    """
+    solver, params = _make_solver(use_slack=True, bounded=True, horizon=5)
     objective = _objective_from_solver(solver, params)
 
     weights = {
-        "slack_penalization_weight": jnp.asarray(100.0, dtype=jnp.float64),
         "weights_penalization_reference_state_trajectory": jnp.asarray(
             params["weights_penalization_reference_state_trajectory"]
         ),
@@ -501,12 +449,102 @@ def test_combined_slack_full_hessian_multi_weight():
     }
 
     grad_ad = jax.grad(objective)(weights)
-    results = _compare_grad(
-        objective,
-        weights,
-        grad_ad,
-        eps=1e-5,
-        rel_tol=5e-2,
-    )
+    results = _compare_grad(objective, weights, grad_ad)
     worst = max(results.values())
     assert worst < 1.0, f"worst score = {worst:.3e}, results={results}"
+
+
+# Parameters that enter the inequality rows, for projection and log-barrier
+# handling. The linear problem's bounds and the obstacle are active at the
+# solution, so every checked gradient flows through the inequality terms.
+
+
+def _assert_gradient_matches_finite_differences(
+    solver, params, key, indices, *, eps, rtol
+):
+    """Compare ``d loss / d params[key]`` at ``indices`` with central differences."""
+    guess = solver.initial_guess(params)
+    value = jnp.asarray(params[key])
+    assert int(solver.solve(guess, params).status) == int(SQPStatus.SOLVED)
+
+    def objective(v):
+        solution = solver.solve(guess, params, weights={key: v})
+        return (
+            jnp.sum(solution.states**2)
+            + jnp.sum(solution.controls**2)
+            + jnp.sum(solution.slack**2)
+        )
+
+    gradient = np.asarray(jax.grad(objective)(value)).ravel()
+    for index in indices:
+        step = np.zeros(value.size)
+        step[index] = eps
+        step = jnp.asarray(step.reshape(value.shape))
+        expected = float(objective(value + step) - objective(value - step)) / (2 * eps)
+        scale = max(abs(expected), abs(gradient[index]), 1.0e-30)
+        assert abs(expected - gradient[index]) / scale < rtol, (
+            f"{key}[{index}]: analytic {gradient[index]:.8e} vs finite difference"
+            f" {expected:.8e}"
+        )
+
+
+@pytest.mark.parametrize(
+    ("constraint_handling", "log_barrier_kappa"), handlings(1.0e-2)
+)
+@pytest.mark.parametrize("use_slack", [False, True])
+@pytest.mark.parametrize(
+    ("key", "indices"),
+    [
+        ("initial_state", [0, 2]),
+        # The active lower velocity and control bounds; see ``linear_problem``.
+        ("state_min_bounds", [2]),
+        ("control_min_bounds", [0]),
+    ],
+)
+def test_bound_and_initial_state_gradients(
+    constraint_handling, log_barrier_kappa, use_slack, key, indices
+):
+    # A wrong or missing backward term shows up at the percent level; 1e-4 is
+    # above the finite-difference noise of the 1e-9 SQP tolerance.
+    problem, params = linear_problem(use_slack=use_slack)
+    _assert_gradient_matches_finite_differences(
+        _turbompc_solver(
+            problem, use_full_hessian=False, log_barrier_kappa=log_barrier_kappa
+        ),
+        params,
+        key,
+        indices,
+        eps=1.0e-6,
+        rtol=1.0e-4,
+    )
+
+
+@pytest.mark.parametrize(
+    ("constraint_handling", "log_barrier_kappa"), handlings(1.0e-3)
+)
+@pytest.mark.parametrize(
+    ("key", "indices"),
+    [
+        ("obstacles_radii", [0]),
+        # x and y of the terminal-stage center, the only stage touching the disk.
+        ("obstacles_centers", [10, 11]),
+    ],
+)
+def test_nonlinear_inequality_parameter_gradients(
+    constraint_handling, log_barrier_kappa, key, indices
+):
+    """A nonlinear inequality needs the exact Lagrangian Hessian.
+
+    ``obstacles_centers`` enters ``G`` itself, so it exercises the mixed second
+    derivative that Gauss-Newton drops; ``obstacles_radii`` only shifts ``g``.
+    """
+    problem, params = obstacle_problem()
+    solver = _turbompc_solver(
+        problem,
+        use_full_hessian=True,
+        log_barrier_kappa=log_barrier_kappa,
+        linesearch="filter",
+    )
+    _assert_gradient_matches_finite_differences(
+        solver, params, key, indices, eps=1.0e-4, rtol=1.0e-5
+    )

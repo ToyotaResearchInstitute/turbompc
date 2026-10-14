@@ -25,6 +25,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+*.bak*
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -123,6 +124,7 @@ celerybeat.pid
 .env
 .venv
 env/
+!examples/rl/env/
 venv/
 venv-torch/
 ENV/
@@ -162,11 +164,10 @@ cython_debug/
 #.idea/
 
 # Ignore timing results and generated plots
-benchmarking/deprecated/
-benchmarking/linear-system/timing_results/
-benchmarking/linear-system/plot_results/figs/
-benchmarking/linear-system/figs/
-benchmarking/linear-system/tmp/
+benchmarking/linear_system/timing_results/
+benchmarking/linear_system/plot_results/figs/
+benchmarking/linear_system/figs/
+benchmarking/linear_system/tmp/
 
 # Ignore generated code, remote data, and trajectory outputs
 c_generated_code/
@@ -177,3 +178,8 @@ c_generated_code/
 
 # Ignore mpc.pytorch submodule changes
 benchmarking/mpc.pytorch/
+
+# Ignore server logs, job files, results
+logs/
+slurm_jobs/
+results/

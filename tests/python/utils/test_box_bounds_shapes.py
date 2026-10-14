@@ -1,4 +1,5 @@
 import jax.numpy as jnp
+
 from tests.helpers.problem_fixtures import tile_spacecraft_inertia
 from turbompc.dynamics.linear_dynamics import LinearDynamics
 from turbompc.dynamics.spacecraft_dynamics import SpacecraftDynamics

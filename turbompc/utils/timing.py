@@ -10,13 +10,15 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax import checkpoint, jit, vmap
+from jax import jit, vmap
+
 from turbompc.dynamics.base_dynamics import Dynamics
 from turbompc.dynamics.integrators import DiscretizationScheme, predict_next_state
 from turbompc.problems.optimal_control_problem import OptimalControlProblem
 from turbompc.solvers.turbompc_solver import (
     BackwardBackend,
     ForwardBackend,
+    HessianApproximation,
     TurboMPCSolver,
 )
 from turbompc.utils.gradient_finitediff import gradient_finite_diff
@@ -104,11 +106,8 @@ def build_rollout_fn(
             next_solution = solution if warm_start else current_solution
             return (new_state, next_solution, new_running_cost), solution.admm_iters
 
-        # Checkpoint each scan step to trade compute for memory.
-        # Without this, JAX stores all intermediate states (50 steps × SQP × ADMM)
-        # for the backward pass, causing OOM at large batch × horizon.
         final_carry, admm_iters = jax.lax.scan(
-            jax.checkpoint(rollout_step), initial_carry, None, length=num_sim_steps
+            rollout_step, initial_carry, None, length=num_sim_steps
         )
         _, _, final_cost = final_carry
         return final_cost, admm_iters
@@ -130,7 +129,7 @@ def benchmark_rollout(
     backward_backend: BackwardBackend = BackwardBackend.ADMM_JAX_LOOP_PCG,
     warm_start: bool = True,
     run_backward: bool = True,
-    use_full_hessian: bool = False,
+    backward_hessian: HessianApproximation = HessianApproximation.GAUSS_NEWTON,
     fd_check: bool = False,
     verbose: bool = True,
 ) -> Tuple[
@@ -170,7 +169,7 @@ def benchmark_rollout(
         params=config.solver_params,
         forward_backend=forward_backend,
         backward_backend=backward_backend,
-        use_full_hessian=use_full_hessian,
+        backward_hessian=backward_hessian,
     )
 
     all_times_fwd: List[float] = []
@@ -202,7 +201,7 @@ def benchmark_rollout(
             return jnp.sum(costs)
 
         if run_backward:
-            rollout_grad = jit(jax.grad(checkpoint(rollout_for_grad)))
+            rollout_grad = jit(jax.grad(rollout_for_grad))
 
         # JIT warm-up
         out = rollout_batch(jnp.zeros_like(initial_states), weights)

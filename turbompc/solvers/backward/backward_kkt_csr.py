@@ -230,7 +230,7 @@ class BatchedKKTCSRPattern:
     rowPtr: np.ndarray  # int32 (Nb*N_kkt + 1,)
     colIdx: np.ndarray  # int32 (Nb*nnz_per_sys,)
     nnz: int  # = Nb * nnz_per_sys
-    N_kkt_total: int  # = Nb * N_kkt_per_sys
+    N_kkt: int  # = Nb * N_kkt_per_sys
     single: KKTCSRPattern
     Nb: int
 
@@ -268,7 +268,7 @@ def build_batched_kkt_csr_pattern(
         rowPtr=rowPtr,
         colIdx=colIdx,
         nnz=total_nnz,
-        N_kkt_total=total_rows,
+        N_kkt=total_rows,
         single=single,
         Nb=Nb,
     )
@@ -306,7 +306,7 @@ def assemble_batched_kkt_csr_values(
 
     def assemble_one(D_i, E_i, A0_i, Am_i, Ap_i, G_i):
         return assemble_kkt_csr_values(D_i, E_i, A0_i, Am_i, Ap_i, G_i, single)
- 
+
     # Assemble once and replicate across the batch if every leaf is unbatched (vmap cannot infer an axis).
     if (
         in_ax_D is None

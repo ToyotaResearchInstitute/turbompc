@@ -1,9 +1,10 @@
 """PCG method for optimal control QPs."""
-from typing import Any, Dict, NamedTuple, Tuple
+from typing import Any, Dict, NamedTuple, Optional, Tuple
 
 import jax.numpy as jnp
 from jax import lax, vmap
 from jax.lax import while_loop
+
 from turbompc.utils.load_params import load_solver_params
 
 DEFAULT_PCG_SOLVER_PARAMS = (
@@ -24,7 +25,7 @@ class SchurComplementMatrices(NamedTuple):
     """Schur complement matrix parameters of the QP."""
 
     S: jnp.ndarray  # (N+1, nx+nu, 3*(nx+nu))
-    preconditioner_Phiinv: jnp.ndarray  # (N+1, nx+nu, 3*(nx+nu))
+    preconditioner_Phiinv: Optional[jnp.ndarray]  # Same shape as S; PCG only.
 
 
 class PCGPrimalOptimalControl:
@@ -87,9 +88,8 @@ class PCGPrimalOptimalControl:
             def get_r_block(gamma, S_block, z_prev, z, z_next):
                 return gamma - S_block @ jnp.concatenate([z_prev, z, z_next])
 
-            zs_padded = jnp.concatenate(
-                [jnp.zeros((1, nz)), zs, jnp.zeros((1, nz))], axis=0
-            )
+            pad = jnp.zeros((1, nz), dtype=zs.dtype)
+            zs_padded = jnp.concatenate([pad, zs, pad], axis=0)
             return vmap(get_r_block)(
                 gammas, S, zs_padded[:-2], zs_padded[1:-1], zs_padded[2:]
             )

@@ -8,10 +8,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+
 from tests.helpers.backend_utils import backend_available
 from tests.helpers.solver_fixtures import turbompc_solver_params
 from turbompc.dynamics.linear_dynamics import LinearDynamics
 from turbompc.problems.optimal_control_problem import OptimalControlProblem
+from turbompc.solvers.status import SQPStatus
 from turbompc.solvers.turbompc_solver import (
     BackwardBackend,
     ForwardBackend,
@@ -78,7 +80,7 @@ def _make_solver(fb, bb, problem, admm_eps=1e-4):
     sp["admm"]["eps_abs"] = admm_eps
     sp["admm"]["eps_rel"] = admm_eps
     sp["num_sqp_iteration_max"] = 2
-    sp["linesearch"] = False
+    sp["linesearch"]["method"] = "none"
     return TurboMPCSolver(
         program=problem,
         params=sp,
@@ -153,6 +155,9 @@ def test_stress_forward(nx, nu, horizon, desc, fb, bb, backend_name):
             )
         raise
 
-    assert sol.status == 0, f"Solver failed: status={sol.status}"
+    assert int(sol.status) in {
+        SQPStatus.SOLVED,
+        SQPStatus.MAX_ITER,
+    }, f"Solver failed: status={sol.status}"
     assert jnp.isfinite(sol.states).all(), "Non-finite states"
     assert jnp.isfinite(sol.controls).all(), "Non-finite controls"

@@ -1,0 +1,112 @@
+# PPO MPC parameters
+# This code uses synthetic data and parameters, and does not represent any manufacturer's product.
+
+algorithm: ppo
+policy: mpc
+env:
+  task: tracking
+  dt: 0.02
+  sim_dt: 0.02
+  ds: 3.0
+  horizon: 32
+  simulator_substeps: 1
+  initial_s: 37.4
+  max_episode_steps: 1000
+  reset_s_jitter: 0.0
+  reset_state_noise: [0.05, 0.25, 0.01, 0.25, 0.05, 0.02]
+  constrain_initial_control: false
+  progress_weight: 0.0
+  tracking_weight: 20.0
+  tracking_weight_scales: [1, 5, 0.5, 5, 1, 1]
+  failure_penalty: 50.0
+  bound_violation_weight: 500.0
+  failure_min_speed: 9.5
+  stall_reset_speed: 9.5
+  off_track_grace_steps: 0
+  state_min_bounds: [-1.0e9, 0.5, -1.0e9, -1.0e9, -4.0, -1.0e9, -1.0e9]
+  state_max_bounds: [1.0e9, 30.0, 1.0e9, 1.0e9, 4.0, 1.0e9, 1.0e9]
+  control_min_bounds: [-0.5, -4000.0, -5000.0]
+  control_max_bounds: [0.5, 370.0, 0.0]
+  domain_randomization:
+    start: uniform
+    start_range: [37.4, 551.5]
+    physics:
+      front_friction_coefficient: [1.0, 1.0]
+      rear_friction_coefficient: [1.0, 1.0]
+solver:
+  constraint_handling: log_barrier
+  log_barrier_kappa: 0.0001
+  use_slack: true
+  slack_weight: 100000.0
+  forward_backend: admm_fused_cudss
+  backward_backend: direct_cudss_ffi
+  num_sqp_iteration_max: 1
+  tol_convergence: 0.001
+  linesearch:
+    method: merit
+    fraction_to_boundary: 0.99
+  admm:
+    rho: 0.1
+    relaxation_parameter: 1.6
+    eps_abs: 1.0e-05
+    eps_rel: 1.0e-05
+    max_iter: 500
+    check_termination_every: 5
+    adapt_rho_every: 25
+    adaptive_rho_tolerance: 5.0
+training:
+  batch_size: 1024
+  device: cuda
+  actor:
+    hidden_sizes: [256, 256]
+    activation: relu
+    output_gain: 0.5
+    initial_sigma: [0.0025, 5.0, 10.0]
+    learn_sigma: false
+    running_cost_segments: 1
+    quadratic_cost_mode: linear
+    learned_terminal_cost: true
+    terminal_weight_multiplier: 1.0
+    weights_linear_penalization_final_state: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    Q_run_init: [10.0, 0.02, 1.0, 0.002, 30.0, 5.0, 0.0]
+    Q_term_init: [10.0, 0.02, 1.0, 0.002, 30.0, 5.0, 0.0]
+    R_init: [0.1, 0.001, 0.001]
+    dR_init: [20000.0, 1.0e-05, 1.0e-09]
+    R_lb: [0.001, 0.0001, 0.0001]
+    R_ub: [1.e3, 1.e3, 1.e3]
+    Q_lb: [0.001, 0.001, 0.001, 0.0001, 0.001, 0.001, 0.0]
+    Q_ub: [1.e3, 1.e3, 1.e3, 1.e2, 1.e3, 1.e3, 0.0]
+  ppo:
+    seed: 0
+    total_updates: 100
+    num_steps: 128
+    num_minibatches: 256  # 512 samples each, matching the archived paper runs.
+    update_epochs: 10
+    critic_iterations: 10
+    actor_learning_rate: 1.0e-05
+    critic_learning_rate: 0.001
+    adam_betas: [0.9, 0.999]
+    adam_epsilon: 1.0e-05
+    anneal_lr: false
+    gamma: 0.99
+    gae_lambda: 0.95
+    clip_coef: 0.2
+    norm_adv: true
+    clip_vloss: true
+    ent_coef: 0.001
+    vf_coef: 0.5
+    max_grad_norm: 1.0
+    target_kl: 0.02
+    normalize_obs: false
+    normalize_reward: true
+    obs_clip: 10.0
+    reward_clip: 100.0
+    eval_every: 10
+    checkpoint_every: 10
+  critic:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    output_gain: 1.0
+evaluation:
+  num_envs: 1
+  steps: 1000

@@ -6,6 +6,7 @@ from typing import Any, Dict, Tuple
 import jax
 import jax.numpy as jnp
 from jax import vmap
+
 from turbompc.dynamics.base_dynamics import Dynamics
 from turbompc.dynamics.integrators import DiscretizationScheme, predict_next_state
 from turbompc.utils.jax_utils import value_and_jacfwd
@@ -128,7 +129,7 @@ class OptimalControlProblem(BaseOptimalControlProblem):
         states:   (N + 1, nx)
         controls: (N + 1, nu)
 
-    Dynamics link stages t and t + 1 for t = 0..N-1. 
+    Dynamics link stages t and t + 1 for t = 0..N-1.
 
     Override `stage_cost`, `terminal_cost`, or `step_inequality_constraints`
     for customization.
@@ -174,7 +175,11 @@ class OptimalControlProblem(BaseOptimalControlProblem):
         self._penalize_control_reference = params.get(
             "penalize_control_reference", False
         )
-        self._use_slack_variables = params.get("use_slack_variables", False)
+        self._use_slack_variables = bool(params.get("use_slack_variables", False))
+        if self._use_slack_variables and "slack_penalization_weight" not in params:
+            raise KeyError(
+                "slack_penalization_weight is required when use_slack_variables=True."
+            )
         self._discretization_scheme = DiscretizationScheme(
             params["discretization_scheme"]
         )
@@ -242,6 +247,11 @@ class OptimalControlProblem(BaseOptimalControlProblem):
     def use_slack_variables(self) -> bool:
         """Whether slack variable are used for inequalities."""
         return self._use_slack_variables
+
+    @property
+    def slack_penalization_weight(self) -> Any:
+        """Quadratic penalty for slack variables."""
+        return self.params.get("slack_penalization_weight", 0.0)
 
     @property
     def num_variables(self) -> int:
@@ -1479,78 +1489,36 @@ class OptimalControlProblem(BaseOptimalControlProblem):
             states, controls, mus, pointwise_params
         )
 
-
-class SlackProblemAdapter:
-    """Adapter that augments a problem to support slack variables.
-
-    Expects params to include:
-      - use_slack_variables: True
-      - slack_penalization_weight: scalar penalty (gamma)
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        params = self.params
-        if "use_slack_variables" not in params:
-            raise KeyError("use_slack_variables should be in params.")
-        if "slack_penalization_weight" not in params:
-            raise KeyError(
-                "slack_penalization_weight should be in slack_penalization_weight."
-            )
-        self._use_slack_variables = bool(params["use_slack_variables"])
-        if not self._use_slack_variables:
-            raise ValueError("SlackProblemAdapter requires use_slack_variables=True.")
+    def inequality_constraints_with_slack(
+        self,
+        states: jnp.ndarray,
+        controls: jnp.ndarray,
+        slacks: jnp.ndarray,
+        params: Dict[str, Any],
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Returns inequality constraints evaluated at g(x, u) + slack.
+        slacks is an array of shape (N + 1, _num_inequality_constraints).
+        """
+        values, lower, upper = self.inequality_constraints(states, controls, params)
+        return values + slacks, lower, upper
 
     def cost_with_slack(
         self,
         states: jnp.ndarray,
         controls: jnp.ndarray,
-        slack: jnp.ndarray,
+        slacks: jnp.ndarray,
         params: Dict[str, Any],
     ) -> jnp.ndarray:
-        """Return cost with 0.5 * gamma * ||slack||^2 added."""
-        base_cost = self.cost(states, controls, params)
-        return base_cost + 0.5 * params["slack_penalization_weight"] * jnp.sum(
-            slack**2
+        """Return total cost with slack variables cost + 0.5 * gamma * ||slack||^2.
+        slacks is an array of shape (N + 1, _num_inequality_constraints).
+        """
+        slack_weight = params["slack_penalization_weight"]
+        return self.cost(states, controls, params) + 0.5 * slack_weight * jnp.sum(
+            slacks**2
         )
-
-    def inequality_constraints_with_slack(
-        self,
-        states: jnp.ndarray,
-        controls: jnp.ndarray,
-        slack: jnp.ndarray,
-        params: Dict[str, Any],
-    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        """Return inequality constraints evaluated at g(x,u)+slack."""
-        g, l, u = self.inequality_constraints(states, controls, params)
-        return g + slack, l, u
-
-    def optimal_slack(
-        self,
-        g: jnp.ndarray,
-        l: jnp.ndarray,
-        u: jnp.ndarray,
-    ) -> jnp.ndarray:
-        """Return slack variables projecting g into [l,u]: proj(g) - g."""
-        proj = jnp.minimum(jnp.maximum(g, l), u)
-        return proj - g
-
-
-def make_slack_problem(base_cls):
-    class SlackProblem(SlackProblemAdapter, base_cls):
-        pass
-
-    SlackProblem.__name__ = f"{base_cls.__name__}Slack"
-    return SlackProblem
-
-
-OptimalControlProblemSlack = make_slack_problem(OptimalControlProblem)
 
 
 __all__ = [
     "BaseOptimalControlProblem",
     "OptimalControlProblem",
-    "OptimalControlProblemSlack",
-    "SlackProblemAdapter",
-    "make_slack_problem",
 ]

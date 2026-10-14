@@ -10,6 +10,7 @@ import scipy.sparse as sp
 jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
+
 from tests.helpers.assertions import assert_solution_nontrivial
 from tests.helpers.backend_utils import backend_param
 from tests.helpers.constants import (
@@ -22,41 +23,49 @@ from tests.helpers.constants import (
     Z_TOL,
     Z_TOL_FUSED,
 )
+from tests.helpers.constraint_handling_fixtures import (
+    HANDLINGS,
+    is_barrier,
+    with_handling,
+)
 from tests.helpers.problem_fixtures import (
     make_drone_params,
     make_linear_params,
     make_spacecraft_params,
 )
 from tests.helpers.solver_fixtures import (
+    build_gauss_newton_qp,
     load_drone_solver_params,
+    make_tiny_qp,
     sqp_osqp_params,
     turbompc_solver_params,
 )
 from turbompc.dynamics.spacecraft_dynamics import SpacecraftDynamics
 from turbompc.problems.obstacle_avoidance import OptimalControlProblemObstacle
-from turbompc.problems.optimal_control_problem import (
-    OptimalControlProblem,
-    OptimalControlProblemSlack,
-)
+from turbompc.problems.optimal_control_problem import OptimalControlProblem
 from turbompc.solvers.admm import ADMMSolver
 from turbompc.solvers.linear_systems_solvers.backends import (
     AdmmBackend,
     SchurSolverBackend,
 )
 from turbompc.solvers.linear_systems_solvers.schur_solver import make_schur_solver
-from turbompc.solvers.qp_utils import ZShape, pack_z
+from turbompc.solvers.qp_utils import ZShape, pack_z, unpack_x
 from turbompc.solvers.sqp_osqp import SQPOSQPSolver
+from turbompc.solvers.status import ADMMStatus, SQPStatus
 from turbompc.solvers.turbompc_solver import (
+    _FORWARD_BACKEND_COMPONENTS,
     BackwardBackend,
     ForwardBackend,
     TurboMPCSolver,
 )
+from turbompc.utils.load_params import load_solver_params
 
 _DEFAULT_BACKWARD: dict[ForwardBackend, BackwardBackend] = {
     ForwardBackend.ADMM_JAX_LOOP_PCG: BackwardBackend.ADMM_JAX_LOOP_PCG,
     ForwardBackend.ADMM_JAX_LOOP_PCG_FFI: BackwardBackend.ADMM_JAX_LOOP_PCG_FFI,
     ForwardBackend.ADMM_JAX_LOOP_CUDSS_FFI: BackwardBackend.ADMM_JAX_LOOP_CUDSS_FFI,
     ForwardBackend.ADMM_JAX_LOOP_JAX_DENSE: BackwardBackend.ADMM_JAX_LOOP_JAX_DENSE,
+    ForwardBackend.ADMM_JAX_LOOP_EIGEN: BackwardBackend.ADMM_JAX_LOOP_EIGEN,
     ForwardBackend.ADMM_FUSED_PCG: BackwardBackend.DIRECT_CUDSS_FFI,
     ForwardBackend.ADMM_FUSED_CUDSS: BackwardBackend.DIRECT_CUDSS_FFI,
 }
@@ -72,6 +81,7 @@ def _resolve_backend(backend):
         SchurSolverBackend.PCG_FFI: ForwardBackend.ADMM_JAX_LOOP_PCG_FFI,
         SchurSolverBackend.CUDSS_FFI: ForwardBackend.ADMM_JAX_LOOP_CUDSS_FFI,
         SchurSolverBackend.JAX_DENSE: ForwardBackend.ADMM_JAX_LOOP_JAX_DENSE,
+        SchurSolverBackend.EIGEN: ForwardBackend.ADMM_JAX_LOOP_EIGEN,
     }
     fb = _MAP[backend]
     return fb, _DEFAULT_BACKWARD[fb]
@@ -96,7 +106,6 @@ def _admm_params(
     *,
     max_iter: int | None = None,
     tol_convergence: float | None = None,
-    linesearch: bool | None = None,
 ) -> Dict[str, Any]:
     solver_params = turbompc_solver_params(
         tol=EQ_TOL if tol_convergence is None else tol_convergence,
@@ -114,8 +123,6 @@ def _admm_params(
         eps = max(eps, 1e-7)
     solver_params["admm"]["eps_abs"] = eps
     solver_params["admm"]["eps_rel"] = eps
-    if linesearch is not None:
-        solver_params["linesearch"] = linesearch
     # Tighten PCG tolerance for PCG_FFI
     if fb == ForwardBackend.ADMM_JAX_LOOP_PCG_FFI:
         solver_params["admm"]["pcg"]["tol_epsilon"] = 1e-12
@@ -128,8 +135,53 @@ ALL_BACKENDS = [
     backend_param(ForwardBackend.ADMM_JAX_LOOP_PCG, marks=[pytest.mark.extended]),
     backend_param(ForwardBackend.ADMM_JAX_LOOP_PCG_FFI, marks=[pytest.mark.extended]),
     backend_param(ForwardBackend.ADMM_JAX_LOOP_CUDSS_FFI, marks=[pytest.mark.extended]),
+    backend_param(ForwardBackend.ADMM_JAX_LOOP_EIGEN, marks=[pytest.mark.extended]),
     backend_param(ForwardBackend.ADMM_FUSED_PCG, marks=[pytest.mark.extended]),
 ]
+
+ALL_ADMM_BACKENDS = ALL_BACKENDS + [
+    backend_param(
+        ForwardBackend.ADMM_JAX_LOOP_JAX_DENSE,
+        marks=[pytest.mark.extended],
+    )
+]
+
+
+def _make_status_admm_solver(
+    backend,
+    *,
+    max_iter,
+    check_termination_every,
+    constraint_handling,
+    log_barrier_kappa,
+):
+    admm_backend, schur_backend = _FORWARD_BACKEND_COMPONENTS[backend]
+    pcg_params = {"max_iter": 100, "tol_epsilon": 1.0e-10}
+    schur_solver = (
+        make_schur_solver(
+            schur_backend,
+            horizon=1,
+            num_states=1,
+            num_controls=0,
+            pcg_params=pcg_params,
+        )
+        if admm_backend == AdmmBackend.JAX_LOOP
+        else None
+    )
+    return ADMMSolver(
+        ZShape(horizon=1, num_states=1, num_controls=0),
+        pcg_params,
+        schur_solver=schur_solver,
+        max_iter=max_iter,
+        check_termination_every=check_termination_every,
+        check_infeasibility_every=1,
+        adapt_rho_every=0,
+        eps_abs=1.0e-8,
+        eps_rel=1.0e-8,
+        admm_backend=admm_backend,
+        constraint_handling=constraint_handling,
+        log_barrier_kappa=log_barrier_kappa,
+    )
 
 
 def _is_fused(backend) -> bool:
@@ -151,6 +203,64 @@ def _tol(backend):
 
 def _assert_nontrivial_solution(sol, *, atol: float = 1e-8):
     assert_solution_nontrivial(sol, atol=atol)
+
+
+@pytest.mark.parametrize("backend", ALL_ADMM_BACKENDS)
+@pytest.mark.parametrize(("constraint_handling", "log_barrier_kappa"), HANDLINGS)
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("solved", ADMMStatus.SOLVED),
+        ("primal_infeasible", ADMMStatus.PRIMAL_INFEASIBLE),
+        ("dual_infeasible", ADMMStatus.DUAL_INFEASIBLE),
+        ("nonfinite", ADMMStatus.NONFINITE),
+        ("iteration_limit", ADMMStatus.MAX_ITER),
+    ],
+    ids=(
+        "solved",
+        "primal_infeasible",
+        "dual_infeasible",
+        "nonfinite",
+        "max_iter",
+    ),
+)
+def test_admm_terminal_statuses_on_tiny_qps(
+    backend, constraint_handling, log_barrier_kappa, case, expected
+):
+    dtype = jnp.float64
+    max_iter = 1 if case == "iteration_limit" else 20
+    # The barrier has no infeasibility certificates; it runs to max_iter.
+    runs_to_limit = is_barrier(log_barrier_kappa) and "infeasible" in case
+    if runs_to_limit:
+        expected = ADMMStatus.MAX_ITER
+    check_termination_every = 10 if case == "iteration_limit" else 1
+    if case == "solved":
+        qp = make_tiny_qp(
+            q=jnp.zeros((2, 1), dtype=dtype),
+            hessian=jnp.ones((2, 1, 1), dtype=dtype),
+        )
+    elif case == "primal_infeasible":
+        qp = make_tiny_qp(q=jnp.zeros((2, 1), dtype=dtype), initial_rhs=1.0)
+    elif case == "dual_infeasible":
+        qp = make_tiny_qp(q=-jnp.ones((2, 1), dtype=dtype))
+    elif case == "nonfinite":
+        qp = make_tiny_qp(q=jnp.full((2, 1), jnp.nan, dtype=dtype))
+    else:
+        qp = make_tiny_qp(
+            q=jnp.ones((2, 1), dtype=dtype),
+            hessian=jnp.ones((2, 1, 1), dtype=dtype),
+        )
+
+    result = _make_status_admm_solver(
+        backend,
+        max_iter=max_iter,
+        check_termination_every=check_termination_every,
+        constraint_handling=constraint_handling,
+        log_barrier_kappa=log_barrier_kappa,
+    ).solve(qp)
+
+    assert int(result.stats.status) == expected
+    assert int(result.stats.num_iter) == (max_iter if runs_to_limit else 1)
 
 
 def _osqp_params(
@@ -190,9 +300,7 @@ def test_turbompc_solver_linear_smoke(
     dynamics, params = make_linear_params(
         horizon, implicit, bounded, rescale, initial_control, rescaling=rescaling
     )
-    solver_params = _admm_params(
-        backend, max_iter=1000, tol_convergence=EQ_TOL, linesearch=False
-    )
+    solver_params = _admm_params(backend, max_iter=1000, tol_convergence=EQ_TOL)
 
     problem = OptimalControlProblem(dynamics=dynamics, params=copy.deepcopy(params))
     solver = _make_solver(problem, solver_params, backend)
@@ -323,7 +431,7 @@ def test_turbompc_solver_matches_osqp_spacecraft(backend, case):
     admm_sol = admm_solver.solve(
         admm_solver.initial_guess(params), problem_params=params
     )
-    assert admm_sol.status == 0
+    assert int(admm_sol.status) in {SQPStatus.SOLVED, SQPStatus.MAX_ITER}
 
     last_idx = max(int(admm_sol.num_iter) - 1, 0)
     assert int(admm_sol.admm_iters[last_idx]) < admm_params["admm"]["max_iter"]
@@ -430,13 +538,15 @@ def test_qp_admm_matches_osqp_spacecraft_implicit_active_bounds(backend):
         ),
         admm_backend=AdmmBackend.JAX_LOOP,
     )
-    qp_data = _make_solver(problem, admm_params, backend)._build_qp_data(
-        states0, controls0, params
+    qp_data = build_gauss_newton_qp(
+        _make_solver(problem, admm_params, backend), states0, controls0, params
     )
-    (states_admm, controls_admm), _, admm_state = admm_solver.solve(
+    admm_result = admm_solver.solve(
         qp_data=qp_data,
         rho_bar=admm_params["admm"]["rho"],
     )
+    admm_state = admm_result.state
+    states_admm, controls_admm = unpack_x(admm_state.x_blocks, zshape)
     z_admm = pack_z(states_admm, controls_admm)
     assert float(jnp.max(jnp.abs(z_osqp - z_admm))) < 2e-3
 
@@ -478,11 +588,16 @@ def test_qp_admm_matches_osqp_spacecraft_implicit_active_bounds(backend):
     "backend",
     ALL_BACKENDS,
 )
-def test_turbompc_solver_warm_start_reduces_admm_iters(backend):
+@pytest.mark.parametrize(("constraint_handling", "log_barrier_kappa"), HANDLINGS)
+def test_turbompc_solver_warm_start_reduces_admm_iters(
+    backend, constraint_handling, log_barrier_kappa
+):
     np.random.seed(0)
     dynamics, params = make_linear_params(4, implicit=False, bounded=False)
 
-    solver_params = _admm_params(backend, max_iter=100, linesearch=False)
+    solver_params = with_handling(
+        _admm_params(backend, max_iter=100), log_barrier_kappa
+    )
     solver_params["num_sqp_iteration_max"] = 3
 
     problem = OptimalControlProblem(dynamics=dynamics, params=copy.deepcopy(params))
@@ -512,9 +627,7 @@ def test_turbompc_solver_respects_initial_control_constraint(backend):
     params["constrain_initial_control"] = True
     params["initial_control"] = init_control
 
-    solver_params = _admm_params(
-        backend, max_iter=100, tol_convergence=1.0e-6, linesearch=False
-    )
+    solver_params = _admm_params(backend, max_iter=100, tol_convergence=1.0e-6)
 
     problem = OptimalControlProblem(dynamics=dynamics, params=copy.deepcopy(params))
     solver = _make_solver(problem, solver_params, backend)
@@ -523,7 +636,7 @@ def test_turbompc_solver_respects_initial_control_constraint(backend):
     osqp_solver = SQPOSQPSolver(program=problem)
     osqp_sol = osqp_solver.solve(problem_params=params)
     assert osqp_sol.status == 0
-    assert sol.status == 0
+    assert int(sol.status) in {SQPStatus.SOLVED, SQPStatus.MAX_ITER}
     assert np.allclose(
         np.asarray(sol.controls[0]), np.asarray(init_control), rtol=1e-6, atol=1e-6
     )
@@ -534,6 +647,7 @@ def test_turbompc_solver_respects_initial_control_constraint(backend):
     ALL_BACKENDS,
 )
 def test_turbompc_solver_matches_osqp_with_slack_linear_ineq(backend):
+    # Projection only: the pinned row has l == u, which has no barrier interior.
     dynamics, params = make_linear_params(3, implicit=False, bounded=False)
     nx = dynamics.num_states
     nu = dynamics.num_controls
@@ -546,16 +660,17 @@ def test_turbompc_solver_matches_osqp_with_slack_linear_ineq(backend):
     params["ineq_include_box"] = True
     params["use_slack_variables"] = True
     params["slack_penalization_weight"] = 10.0
+    problem = OptimalControlProblem(dynamics=dynamics, params=params)
 
-    problem = OptimalControlProblemSlack(dynamics=dynamics, params=params)
-
-    solver_osqp = SQPOSQPSolver(program=problem)
+    osqp_params = load_solver_params("sqp_osqp.yaml")
+    solver_osqp = SQPOSQPSolver(program=problem, params=osqp_params)
     sol_osqp = solver_osqp.solve(problem_params=params)
     assert sol_osqp.status == 0
 
+    admm_params = _admm_params(backend)
     solver_admm = _make_solver(
         problem,
-        _admm_params(backend),
+        admm_params,
         backend,
         # backward backend is part of the solver enum; no separate flag
     )
@@ -584,6 +699,57 @@ def test_turbompc_solver_matches_osqp_with_slack_linear_ineq(backend):
     )
     g_raw = g_raw.reshape(-1)
     assert jnp.any(g_raw < l_raw.reshape(-1) - 1.0e-6)
+
+
+@pytest.mark.parametrize("backend", ALL_ADMM_BACKENDS)
+def test_sqp_reports_infeasible_nonlinear_qp_and_slack_recovery(backend):
+    dynamics, base_params = make_linear_params(1, implicit=False, bounded=False)
+    initial_state = jnp.asarray(base_params["initial_state"])
+    base_params.update(
+        obstacles_dimension=2,
+        obstacles_centers=initial_state[None, :2] + jnp.asarray([[0.1, 0.0]]),
+        obstacles_radii=jnp.asarray([1.0]),
+        rescale_optimization_variables=False,
+    )
+
+    solver_params = _admm_params(backend, max_iter=100)
+    solver_params["num_sqp_iteration_max"] = 1
+    solver_params["linesearch"]["method"] = "none"
+    solver_params["admm"]["check_termination_every"] = 1
+    solver_params["admm"]["adapt_rho_every"] = 0
+
+    hard_params = copy.deepcopy(base_params)
+    hard_problem = OptimalControlProblemObstacle(
+        dynamics=dynamics,
+        params=hard_params,
+    )
+    hard_solver = _make_solver(hard_problem, solver_params, backend)
+    hard_solution = hard_solver.solve(
+        hard_solver.initial_guess(hard_params),
+        problem_params=hard_params,
+    )
+    assert int(hard_solution.status) == SQPStatus.QP_FAILED
+    assert int(hard_solution.stats.last_qp.status) == ADMMStatus.PRIMAL_INFEASIBLE
+
+    slack_params = copy.deepcopy(base_params)
+    slack_params["use_slack_variables"] = True
+    slack_params["slack_penalization_weight"] = 10.0
+    slack_problem = OptimalControlProblemObstacle(
+        dynamics=dynamics,
+        params=slack_params,
+    )
+    slack_solver_params = copy.deepcopy(solver_params)
+    slack_solver = _make_solver(slack_problem, slack_solver_params, backend)
+    slack_solution = slack_solver.solve(
+        slack_solver.initial_guess(slack_params),
+        problem_params=slack_params,
+    )
+    assert int(slack_solution.status) == SQPStatus.MAX_ITER
+    assert int(slack_solution.stats.last_qp.status) in {
+        ADMMStatus.SOLVED,
+        ADMMStatus.MAX_ITER,
+    }
+    assert jnp.max(jnp.abs(slack_solution.slack)) > 0.0
 
 
 @pytest.mark.parametrize(
@@ -698,6 +864,7 @@ def test_turbompc_solver_integrators(backend, scheme, scheme_id):
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
+@pytest.mark.parametrize(("constraint_handling", "log_barrier_kappa"), HANDLINGS)
 @pytest.mark.parametrize(
     "control_bound,state_bound_factor,desc",
     [
@@ -708,7 +875,12 @@ def test_turbompc_solver_integrators(backend, scheme, scheme_id):
     ids=lambda x: x if isinstance(x, str) else None,
 )
 def test_turbompc_solver_constraint_types(
-    backend, control_bound, state_bound_factor, desc
+    backend,
+    constraint_handling,
+    log_barrier_kappa,
+    control_bound,
+    state_bound_factor,
+    desc,
 ):
     """Box constraints: control-only, state-only, and both tight."""
     from turbompc.dynamics.spacecraft_dynamics import SpacecraftDynamics
@@ -727,13 +899,14 @@ def test_turbompc_solver_constraint_types(
     )
 
     problem = OptimalControlProblem(dynamics=SpacecraftDynamics(), params=params)
-    solver_params = _admm_params(backend, max_iter=5000)
+    solver_params = with_handling(
+        _admm_params(backend, max_iter=5000), log_barrier_kappa
+    )
     solver_params["num_sqp_iteration_max"] = 10
     solver = _make_solver(problem, solver_params, backend)
 
     sol = solver.solve(solver.initial_guess(params), problem_params=params)
-    assert sol.status == 0
-    _assert_nontrivial_solution(sol)
+    assert_solution_nontrivial(sol, allow_max_iter=True)
 
     # Check bounds are respected
     z_tol, _ = _tol(backend)
@@ -750,7 +923,10 @@ def test_turbompc_solver_constraint_types(
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
-def test_turbompc_solver_obstacle_avoidance_general_ineq(backend):
+@pytest.mark.parametrize(("constraint_handling", "log_barrier_kappa"), HANDLINGS)
+def test_turbompc_solver_obstacle_avoidance_general_ineq(
+    backend, constraint_handling, log_barrier_kappa
+):
     """General nonlinear inequality constraints (obstacle avoidance)."""
     horizon = 50
     obs_centers = jnp.array([[-1.4, -0.1], [-0.7, 0.3]])
@@ -761,12 +937,14 @@ def test_turbompc_solver_obstacle_avoidance_general_ineq(backend):
     _, solver2_params = load_drone_solver_params()
 
     problem = OptimalControlProblemObstacle(dynamics=dynamics, params=problem_params)
-    solver = _make_solver(problem, solver2_params, backend)
+    solver = _make_solver(
+        problem, with_handling(solver2_params, log_barrier_kappa), backend
+    )
     sol = solver.solve(
         solver.initial_guess(problem_params), problem_params=problem_params
     )
 
-    _assert_nontrivial_solution(sol)
+    assert_solution_nontrivial(sol, allow_max_iter=True)
 
     # Equality constraints (dynamics)
     eq = problem.equality_constraints(sol.states, sol.controls, problem_params)

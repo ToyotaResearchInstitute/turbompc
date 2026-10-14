@@ -24,15 +24,18 @@ static ffi::Error AdmmFusedCudaImpl(
     BufT xi_g0, BufT rho_bar_init,
     BufT slack_weight_init,  // [Nb] runtime slack weight (JAX-traceable)
     // Config attrs
-    int64_t max_iter, int64_t pcg_max_iter, int64_t check_every,
-    double eps_abs, double eps_rel, double sigma,
+    int64_t max_iter, int64_t pcg_max_iter, int64_t check_termination_every,
+    int64_t check_infeasibility_every,
+    double eps_abs, double eps_rel, double eps_prim_inf, double eps_dual_inf,
+    double sigma,
     double rho_f_factor, double alpha, double pcg_eps,
     int64_t nx64, int64_t n064, int64_t m64,
     int64_t use_slack64,
     int64_t adapt_rho_every64, double adaptive_rho_tolerance,
+    double rho_update_max_factor,
     double rho_min, double rho_max,
-    // Results (10 + 2 workspace)
-    ffi::Result<BufT>  x_out,
+    int64_t constraint_handling, double log_barrier_kappa,
+    // Results (11 public/state outputs + 3 private workspaces)
     ffi::Result<BufU32> iters_out,
     ffi::Result<BufT>  x_blocks_out,
     ffi::Result<BufT>  z_g_out,
@@ -42,6 +45,9 @@ static ffi::Error AdmmFusedCudaImpl(
     ffi::Result<BufT>  xi_g_out,
     ffi::Result<BufT>  rho_bar_out,
     ffi::Result<BufT>  kernel_ns_out,
+    ffi::Result<BufU32> status_out,
+    ffi::Result<BufT>  residuals_out,
+    ffi::Result<BufT>  certificate_work_out,
     ffi::Result<BufT>  S_work_out,
     ffi::Result<BufT>  Phiinv_work_out)
 {
@@ -70,9 +76,14 @@ static ffi::Error AdmmFusedCudaImpl(
     ADMMConfig cfg;
     cfg.max_iter     = static_cast<int32_t>(max_iter);
     cfg.pcg_max_iter = static_cast<int32_t>(pcg_max_iter);
-    cfg.check_every  = static_cast<int32_t>(check_every);
+    cfg.check_termination_every =
+        static_cast<int32_t>(check_termination_every);
+    cfg.check_infeasibility_every =
+        static_cast<int32_t>(check_infeasibility_every);
     cfg.eps_abs      = eps_abs;
     cfg.eps_rel      = eps_rel;
+    cfg.eps_prim_inf = eps_prim_inf;
+    cfg.eps_dual_inf = eps_dual_inf;
     cfg.sigma        = sigma;
     cfg.rho_f_factor = rho_f_factor;
     cfg.alpha        = alpha;
@@ -81,14 +92,16 @@ static ffi::Error AdmmFusedCudaImpl(
     cfg.use_slack    = (use_slack64 != 0);
     cfg.adapt_rho_every        = static_cast<int32_t>(adapt_rho_every64);
     cfg.adaptive_rho_tolerance = adaptive_rho_tolerance;
+    cfg.rho_update_max_factor  = rho_update_max_factor;
     cfg.rho_min                = rho_min;
     cfg.rho_max                = rho_max;
+    cfg.constraint_handling    = static_cast<ConstraintHandling>(constraint_handling);
+    cfg.log_barrier_kappa      = log_barrier_kappa;
 
     cudaError_t launch_err;
     if constexpr (std::is_same_v<Scalar, float>) {
         launch_err = LaunchADMMFusedF32(
             stream,
-            x_out->typed_data(),
             iters_out->typed_data(),
             x_blocks_out->typed_data(),
             z_g_out->typed_data(),
@@ -98,6 +111,8 @@ static ffi::Error AdmmFusedCudaImpl(
             xi_g_out->typed_data(),
             rho_bar_out->typed_data(),
             kernel_ns_out->typed_data(),
+            status_out->typed_data(), residuals_out->typed_data(),
+            certificate_work_out->typed_data(),
             S_work_out->typed_data(),
             Phiinv_work_out->typed_data(),
             S.typed_data(), Phiinv.typed_data(),
@@ -113,7 +128,6 @@ static ffi::Error AdmmFusedCudaImpl(
     } else {
         launch_err = LaunchADMMFusedF64(
             stream,
-            x_out->typed_data(),
             iters_out->typed_data(),
             x_blocks_out->typed_data(),
             z_g_out->typed_data(),
@@ -123,6 +137,8 @@ static ffi::Error AdmmFusedCudaImpl(
             xi_g_out->typed_data(),
             rho_bar_out->typed_data(),
             kernel_ns_out->typed_data(),
+            status_out->typed_data(), residuals_out->typed_data(),
+            certificate_work_out->typed_data(),
             S_work_out->typed_data(),
             Phiinv_work_out->typed_data(),
             S.typed_data(), Phiinv.typed_data(),
@@ -174,12 +190,15 @@ extern "C" XLA_FFI_Error* AdmmFusedCuda(XLA_FFI_CallFrame* call_frame) {
             .Arg<BufF32>()   // xi_g0
             .Arg<BufF32>()   // rho_bar_init
             .Arg<BufF32>()   // slack_weight_init
-            // Config attrs (16)
+            // Config attrs
             .Attr<int64_t>("max_iter")
             .Attr<int64_t>("pcg_max_iter")
-            .Attr<int64_t>("check_every")
+            .Attr<int64_t>("check_termination_every")
+            .Attr<int64_t>("check_infeasibility_every")
             .Attr<double>("eps_abs")
             .Attr<double>("eps_rel")
+            .Attr<double>("eps_prim_inf")
+            .Attr<double>("eps_dual_inf")
             .Attr<double>("sigma")
             .Attr<double>("rho_f_factor")
             .Attr<double>("alpha")
@@ -190,10 +209,12 @@ extern "C" XLA_FFI_Error* AdmmFusedCuda(XLA_FFI_CallFrame* call_frame) {
             .Attr<int64_t>("use_slack")
             .Attr<int64_t>("adapt_rho_every")
             .Attr<double>("adaptive_rho_tolerance")
+            .Attr<double>("rho_update_max_factor")
             .Attr<double>("rho_min")
             .Attr<double>("rho_max")
-            // Results (10 + 2 workspace)
-            .Ret<BufF32>()   // x_out
+            .Attr<int64_t>("constraint_handling")
+            .Attr<double>("log_barrier_kappa")
+            // Results (11 public/state outputs + 3 private workspaces)
             .Ret<BufU32>()   // iters_out
             .Ret<BufF32>()   // x_blocks_out
             .Ret<BufF32>()   // z_g_out
@@ -203,6 +224,9 @@ extern "C" XLA_FFI_Error* AdmmFusedCuda(XLA_FFI_CallFrame* call_frame) {
             .Ret<BufF32>()   // xi_g_out
             .Ret<BufF32>()   // rho_bar_out
             .Ret<BufF32>()   // kernel_ns_out
+            .Ret<BufU32>()   // status_out
+            .Ret<BufF32>()   // terminal residuals and limits
+            .Ret<BufF32>()   // certificate workspace
             .Ret<BufF32>()   // S_work
             .Ret<BufF32>()   // Phiinv_work
             .To(AdmmFusedCudaImpl<BufF32, float>)
@@ -237,12 +261,15 @@ extern "C" XLA_FFI_Error* AdmmFusedCudaF64(XLA_FFI_CallFrame* call_frame) {
             .Arg<BufF64>()   // xi_g0
             .Arg<BufF64>()   // rho_bar_init
             .Arg<BufF64>()   // slack_weight_init
-            // Config attrs (16)
+            // Config attrs
             .Attr<int64_t>("max_iter")
             .Attr<int64_t>("pcg_max_iter")
-            .Attr<int64_t>("check_every")
+            .Attr<int64_t>("check_termination_every")
+            .Attr<int64_t>("check_infeasibility_every")
             .Attr<double>("eps_abs")
             .Attr<double>("eps_rel")
+            .Attr<double>("eps_prim_inf")
+            .Attr<double>("eps_dual_inf")
             .Attr<double>("sigma")
             .Attr<double>("rho_f_factor")
             .Attr<double>("alpha")
@@ -253,10 +280,12 @@ extern "C" XLA_FFI_Error* AdmmFusedCudaF64(XLA_FFI_CallFrame* call_frame) {
             .Attr<int64_t>("use_slack")
             .Attr<int64_t>("adapt_rho_every")
             .Attr<double>("adaptive_rho_tolerance")
+            .Attr<double>("rho_update_max_factor")
             .Attr<double>("rho_min")
             .Attr<double>("rho_max")
-            // Results (10 + 2 workspace)
-            .Ret<BufF64>()   // x_out
+            .Attr<int64_t>("constraint_handling")
+            .Attr<double>("log_barrier_kappa")
+            // Results (11 public/state outputs + 3 private workspaces)
             .Ret<BufU32>()   // iters_out
             .Ret<BufF64>()   // x_blocks_out
             .Ret<BufF64>()   // z_g_out
@@ -266,6 +295,9 @@ extern "C" XLA_FFI_Error* AdmmFusedCudaF64(XLA_FFI_CallFrame* call_frame) {
             .Ret<BufF64>()   // xi_g_out
             .Ret<BufF64>()   // rho_bar_out
             .Ret<BufF64>()   // kernel_ns_out
+            .Ret<BufU32>()   // status_out
+            .Ret<BufF64>()   // terminal residuals and limits
+            .Ret<BufF64>()   // certificate workspace
             .Ret<BufF64>()   // S_work
             .Ret<BufF64>()   // Phiinv_work
             .To(AdmmFusedCudaImpl<BufF64, double>)

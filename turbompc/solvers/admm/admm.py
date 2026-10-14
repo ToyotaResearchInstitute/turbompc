@@ -1,13 +1,23 @@
 """ADMM solver for box-constrained optimal control QPs."""
+from math import isfinite, isnan
 from typing import NamedTuple, Optional, Tuple
 
 import jax.numpy as jnp
 from jax import lax, vmap
+
+from turbompc.solvers.admm.inequality_log_barrier import (
+    log_barrier_prox_update,
+    prox_two_sided_log_barrier,
+    relaxed_log_barrier_prox_update,
+)
+from turbompc.solvers.constraint_handling import ConstraintHandling
 from turbompc.solvers.linear_systems_solvers.backends import AdmmBackend
 from turbompc.solvers.linear_systems_solvers.pcg_primal import SchurComplementMatrices
 from turbompc.solvers.linear_systems_solvers.schur_solver import SchurSystemSolver
-from turbompc.solvers.qp_data import QPData, QPEqualityBlocks
-from turbompc.solvers.qp_utils import ZShape, pack_x, unpack_x
+from turbompc.solvers.qp_data import QPData, QPEqualityBlocks, QPInequalityBlocks
+from turbompc.solvers.qp_utils import ZShape, pack_x
+from turbompc.solvers.status import ADMMStatus
+from turbompc.utils.jax_utils import tree_all_finite
 
 
 class ADMMParams(NamedTuple):
@@ -20,8 +30,12 @@ class ADMMParams(NamedTuple):
     check_termination_every: int
     adapt_rho_every: int
     adaptive_rho_tolerance: float
+    rho_update_max_factor: float
     rho_f_factor: float
     alpha: float  # Over-relaxation parameter
+    eps_prim_inf: float = 1.0e-4
+    eps_dual_inf: float = 1.0e-4
+    check_infeasibility_every: int = 25
 
 
 class ADMMState(NamedTuple):
@@ -34,29 +48,43 @@ class ADMMState(NamedTuple):
     rho_bar: jnp.ndarray
 
 
-class ADMMSolveResult(NamedTuple):
-    """Result from a fused ADMM FFI solve.
-
-    Using a NamedTuple prevents unpacking errors when new fields are added.
-    Callers should use attribute access: result.x_out, result.state, etc.
-    """
-
-    x_out: jnp.ndarray  # (T, n) primal solution
-    iters_out: jnp.ndarray  # scalar, number of ADMM iterations
-    state: ADMMState  # full ADMM state for warm-starting
-    kernel_ns: jnp.ndarray  # GPU kernel time in nanoseconds
-
-
 class ADMMStats(NamedTuple):
+    """ADMM solve statistics."""
+
+    status: jnp.ndarray
+    num_iter: jnp.ndarray
+    primal_residual: jnp.ndarray
+    primal_residual_limit: jnp.ndarray
+    dual_residual: jnp.ndarray
+    dual_residual_limit: jnp.ndarray
+
+
+class ADMMIterationStats(NamedTuple):
+    """ADMM solve statistics over multiple iterates."""
+
+    residuals_valid: jnp.ndarray  # True where residuals and limits were evaluated.
     primal_residuals: jnp.ndarray
     dual_residuals: jnp.ndarray
-    primal_residual_norm_terms: jnp.ndarray
-    dual_residual_norm_terms: jnp.ndarray
-    primal_residual_margins: jnp.ndarray
-    dual_residual_margins: jnp.ndarray
-    num_pcg_iters: jnp.ndarray
-    num_iter: jnp.ndarray
+    primal_residual_limits: jnp.ndarray
+    dual_residual_limits: jnp.ndarray
     rhos: jnp.ndarray
+    linear_solver_iterations: Optional[jnp.ndarray] = None
+
+
+class ADMMResult(NamedTuple):
+    """ADMM result."""
+
+    state: ADMMState
+    stats: ADMMStats
+    iterations: Optional[ADMMIterationStats] = None
+
+
+class FusedADMMSolveResult(NamedTuple):
+    """Result returned by a fused ADMM FFI wrapper."""
+
+    state: ADMMState
+    stats: ADMMStats
+    kernel_ns: jnp.ndarray
 
 
 class ADMMResiduals(NamedTuple):
@@ -68,13 +96,84 @@ class ADMMResiduals(NamedTuple):
     dual_residual_norm_term: jnp.ndarray
 
 
-def compute_S_Phiinv(
+class _ADMMInfeasibilityDetection(NamedTuple):
+    """Infeasibility decisions from one pair of consecutive iterates."""
+
+    primal_infeasible_detected: jnp.ndarray
+    dual_infeasible_detected: jnp.ndarray
+
+
+def empty_admm_stats(dtype: jnp.dtype, shape: Tuple[int, ...] = ()) -> ADMMStats:
+    """ADMM solve statistics for a solve that has not run."""
+    zero = jnp.zeros(shape, dtype=dtype)
+    return ADMMStats(
+        status=jnp.full(shape, jnp.int32(ADMMStatus.NOT_RUN), dtype=jnp.int32),
+        num_iter=jnp.zeros(shape, dtype=jnp.int32),
+        primal_residual=zero,
+        primal_residual_limit=zero,
+        dual_residual=zero,
+        dual_residual_limit=zero,
+    )
+
+
+def _select_admm_status(
+    nonfinite: jnp.ndarray,
+    solved: jnp.ndarray,
+    primal_infeasible: jnp.ndarray,
+    dual_infeasible: jnp.ndarray,
+    iteration_limit_reached: jnp.ndarray,
+) -> jnp.ndarray:
+    """Select status in priority order.
+
+    NONFINITE > SOLVED > PRIMAL_INFEASIBLE > DUAL_INFEASIBLE > MAX_ITER > NOT_RUN.
+    """
+    return jnp.where(
+        nonfinite,
+        jnp.int32(ADMMStatus.NONFINITE),
+        jnp.where(
+            solved,
+            jnp.int32(ADMMStatus.SOLVED),
+            jnp.where(
+                primal_infeasible,
+                jnp.int32(ADMMStatus.PRIMAL_INFEASIBLE),
+                jnp.where(
+                    dual_infeasible,
+                    jnp.int32(ADMMStatus.DUAL_INFEASIBLE),
+                    jnp.where(
+                        iteration_limit_reached,
+                        jnp.int32(ADMMStatus.MAX_ITER),
+                        jnp.int32(ADMMStatus.NOT_RUN),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def _make_admm_stats(
+    status: jnp.ndarray,
+    num_iter: jnp.ndarray,
+    residuals: ADMMResiduals,
+    eps_abs: float,
+    eps_rel: float,
+) -> ADMMStats:
+    return ADMMStats(
+        status=status,
+        num_iter=num_iter.astype(jnp.int32),
+        primal_residual=residuals.primal_residual,
+        primal_residual_limit=(eps_abs + eps_rel * residuals.primal_residual_norm_term),
+        dual_residual=residuals.dual_residual,
+        dual_residual_limit=eps_abs + eps_rel * residuals.dual_residual_norm_term,
+    )
+
+
+def _compute_S_blocks(
     qp_data: QPData,
     rho_f: float,
     sigma: float,
     rho_ineq: float = 0.0,
-) -> SchurComplementMatrices:
-    """Assemble the block-tridiagonal Schur matrix and Jacobi preconditioner."""
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Assemble the Schur matrix and return its diagonal/off-diagonal blocks."""
     D = qp_data.cost.D
     E = qp_data.cost.E
     A0 = qp_data.eq.A0
@@ -102,23 +201,40 @@ def compute_S_Phiinv(
 
     thetas = Dtilde
     phis = Etilde
-    thetas_inv = vmap(jnp.linalg.inv)(thetas)
 
     def get_S(thetas, phis):
         def get_S_block(theta, phi, phi_prev):
             return jnp.concatenate([phi_prev, theta, phi.T], axis=1)
 
-        phis_padded = jnp.concatenate(
-            [
-                jnp.zeros((1, n, n)),
-                phis,
-                jnp.zeros((1, n, n)),
-            ],
-            axis=0,
-        )
+        pad = jnp.zeros((1, n, n), dtype=phis.dtype)
+        phis_padded = jnp.concatenate([pad, phis, pad], axis=0)
         return vmap(get_S_block)(thetas, phis_padded[1:], phis_padded[:-1])
 
     S = get_S(thetas, phis)
+    return S, thetas, phis
+
+
+def compute_S(
+    qp_data: QPData,
+    rho_f: float,
+    sigma: float,
+    rho_ineq: float = 0.0,
+) -> SchurComplementMatrices:
+    """Assemble the block-tridiagonal Schur matrix without a preconditioner."""
+    S, _, _ = _compute_S_blocks(qp_data, rho_f, sigma, rho_ineq)
+    return SchurComplementMatrices(S=S, preconditioner_Phiinv=None)
+
+
+def compute_S_Phiinv(
+    qp_data: QPData,
+    rho_f: float,
+    sigma: float,
+    rho_ineq: float = 0.0,
+) -> SchurComplementMatrices:
+    """Assemble the block-tridiagonal Schur matrix and Jacobi preconditioner."""
+    S, thetas, phis = _compute_S_blocks(qp_data, rho_f, sigma, rho_ineq)
+    n = thetas.shape[1]
+    thetas_inv = vmap(jnp.linalg.inv)(thetas)
 
     def get_Phiinv(thetas_inv, phis):
         def get_Phiinv_block(theta_prev_inv, theta_inv, theta_next_inv, phi, phi_prev):
@@ -126,22 +242,9 @@ def compute_S_Phiinv(
             prod_term_next = theta_inv @ phi.T @ theta_next_inv
             return jnp.concatenate([prod_term_prev, -theta_inv, prod_term_next], axis=1)
 
-        thetas_inv_padded = jnp.concatenate(
-            [
-                jnp.zeros((1, n, n)),
-                thetas_inv,
-                jnp.zeros((1, n, n)),
-            ],
-            axis=0,
-        )
-        phis_padded = jnp.concatenate(
-            [
-                jnp.zeros((1, n, n)),
-                phis,
-                jnp.zeros((1, n, n)),
-            ],
-            axis=0,
-        )
+        pad = jnp.zeros((1, n, n), dtype=thetas_inv.dtype)
+        thetas_inv_padded = jnp.concatenate([pad, thetas_inv, pad], axis=0)
+        phis_padded = jnp.concatenate([pad, phis, pad], axis=0)
         return vmap(get_Phiinv_block)(
             thetas_inv_padded[:-2],
             thetas_inv_padded[1:-1],
@@ -178,7 +281,51 @@ def _project_box(x: jnp.ndarray, lower: jnp.ndarray, upper: jnp.ndarray) -> jnp.
     return jnp.minimum(jnp.maximum(x, lower), upper)
 
 
+def _projection_inequality_update(
+    z_tilde: jnp.ndarray,
+    ineq: QPInequalityBlocks,
+    rho_bar: jnp.ndarray,
+    *,
+    use_slack_variables: bool,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Return ``(z_g, xi_g)`` for hard or quadratically relaxed projection."""
+    proj = _project_box(z_tilde, ineq.l, ineq.u)
+    if not use_slack_variables:
+        return proj, jnp.zeros_like(proj)
+    gamma = ineq.slack_penalization_weight
+    frac = gamma / (gamma + rho_bar)
+    z_g = (1.0 - frac) * z_tilde + frac * proj
+    xi_g = (rho_bar / (gamma + rho_bar)) * (proj - z_tilde)
+    return z_g, xi_g
+
+
+def _log_barrier_inequality_update(
+    z_tilde: jnp.ndarray,
+    ineq: QPInequalityBlocks,
+    rho_bar: jnp.ndarray,
+    log_barrier_kappa: float,
+    *,
+    use_slack_variables: bool,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Return ``(z_g, xi_g)`` for pure or slack-relaxed log-barrier handling."""
+    log_barrier_kappa_array = jnp.asarray(log_barrier_kappa, dtype=z_tilde.dtype)
+    if not use_slack_variables:
+        return log_barrier_prox_update(
+            z_tilde, ineq.l, ineq.u, log_barrier_kappa_array, rho_bar
+        )
+    return relaxed_log_barrier_prox_update(
+        z_tilde,
+        ineq.l,
+        ineq.u,
+        log_barrier_kappa_array,
+        rho_bar,
+        ineq.slack_penalization_weight,
+    )
+
+
 def _inf_norm(x: jnp.ndarray) -> jnp.ndarray:
+    if not x.size:
+        return jnp.asarray(0.0, dtype=x.dtype)
     return jnp.max(jnp.abs(x))
 
 
@@ -266,6 +413,8 @@ def _apply_Gt(qp_data: QPData, y_g: jnp.ndarray) -> jnp.ndarray:
 def _compute_residuals(
     qp_data: QPData,
     state: ADMMState,
+    *,
+    use_slack_variables: bool = False,
 ) -> ADMMResiduals:
     x_blocks = state.x_blocks
 
@@ -298,7 +447,7 @@ def _compute_residuals(
 
     dual_vec = Px + qp_data.cost.q + Ct_yf + Gt_yg
     dual_residual = _inf_norm(dual_vec)
-    if qp_data.ineq.use_slack_variables and qp_data.ineq.G.shape[1] > 0:
+    if use_slack_variables and qp_data.ineq.G.shape[1] > 0:
         dual_residual = jnp.maximum(
             dual_residual,
             _inf_norm(qp_data.ineq.slack_penalization_weight * state.xi_g + state.y_g),
@@ -309,7 +458,7 @@ def _compute_residuals(
         jnp.maximum(_inf_norm(Px), _inf_norm(Aty)),
         _inf_norm(qp_data.cost.q),
     )
-    if qp_data.ineq.use_slack_variables and qp_data.ineq.G.shape[1] > 0:
+    if use_slack_variables and qp_data.ineq.G.shape[1] > 0:
         dual_norm_term = jnp.maximum(
             dual_norm_term,
             jnp.maximum(
@@ -331,15 +480,133 @@ def _compute_residuals(
     )
 
 
+def _bound_support(
+    direction: jnp.ndarray, lower: jnp.ndarray, upper: jnp.ndarray
+) -> jnp.ndarray:
+    """Support of a box, avoiding undefined ``0 * inf`` products."""
+    positive = direction > 0
+    negative = direction < 0
+    finite_upper_product = (
+        jnp.where(jnp.isposinf(upper), jnp.zeros_like(upper), upper) * direction
+    )
+    finite_lower_product = (
+        jnp.where(jnp.isneginf(lower), jnp.zeros_like(lower), lower) * direction
+    )
+    positive_terms = jnp.where(
+        positive,
+        jnp.where(jnp.isposinf(upper), jnp.inf, finite_upper_product),
+        0.0,
+    )
+    negative_terms = jnp.where(
+        negative,
+        jnp.where(jnp.isneginf(lower), jnp.inf, finite_lower_product),
+        0.0,
+    )
+    return jnp.sum(positive_terms + negative_terms)
+
+
+def _bound_direction_violation(
+    direction: jnp.ndarray, lower: jnp.ndarray, upper: jnp.ndarray
+) -> jnp.ndarray:
+    """Return how much a direction violates the directions allowed by box bounds."""
+    lower_finite = jnp.isfinite(lower)
+    upper_finite = jnp.isfinite(upper)
+    both = lower_finite & upper_finite
+    lower_only = lower_finite & ~upper_finite
+    upper_only = ~lower_finite & upper_finite
+    violations = jnp.where(
+        both,
+        jnp.abs(direction),
+        jnp.where(
+            lower_only,
+            jnp.maximum(-direction, 0.0),
+            jnp.where(upper_only, jnp.maximum(direction, 0.0), 0.0),
+        ),
+    )
+    return _inf_norm(violations)
+
+
+def _compute_infeasibility_certificates(
+    qp_data: QPData,
+    previous: ADMMState,
+    current: ADMMState,
+    eps_prim_inf: float,
+    eps_dual_inf: float,
+    *,
+    use_slack_variables: bool = False,
+) -> _ADMMInfeasibilityDetection:
+    """Evaluate infeasibility certificates from consecutive ADMM differences."""
+    dx = current.x_blocks - previous.x_blocks
+    dxi = current.xi_g - previous.xi_g
+    dy_g = current.y_g - previous.y_g
+    dy_f_0 = current.y_f_0 - previous.y_f_0
+    dy_f_dyn = current.y_f_dyn - previous.y_f_dyn
+    c_stack = jnp.concatenate([qp_data.eq.c0, qp_data.eq.c.reshape(-1)])
+    dy_f_stack = jnp.concatenate([dy_f_0, dy_f_dyn.reshape(-1)])
+
+    dy_norm = jnp.maximum(_inf_norm(dy_f_stack), _inf_norm(dy_g))
+    primal_stationarity = _inf_norm(
+        _apply_Ct(qp_data, dy_f_0, dy_f_dyn) + _apply_Gt(qp_data, dy_g)
+    )
+    if use_slack_variables and dy_g.size:
+        primal_stationarity = jnp.maximum(primal_stationarity, _inf_norm(dy_g))
+    primal_support = jnp.vdot(c_stack, dy_f_stack)
+    if dy_g.size:
+        primal_support = primal_support + _bound_support(
+            dy_g, qp_data.ineq.l, qp_data.ineq.u
+        )
+
+    dx_norm = _inf_norm(dx)
+    if use_slack_variables and dxi.size:
+        dx_norm = jnp.maximum(dx_norm, _inf_norm(dxi))
+    dual_hessian = _inf_norm(_apply_P(qp_data, dx))
+    if use_slack_variables and dxi.size:
+        dual_hessian = jnp.maximum(
+            dual_hessian,
+            qp_data.ineq.slack_penalization_weight * _inf_norm(dxi),
+        )
+    dual_objective = jnp.vdot(qp_data.cost.q, dx)
+    equality_direction = _inf_norm(_apply_C(qp_data, dx))
+    inequality_direction = _apply_G(qp_data, dx)
+    if use_slack_variables:
+        inequality_direction = inequality_direction + dxi
+    dual_direction_violation = jnp.maximum(
+        equality_direction,
+        _bound_direction_violation(
+            inequality_direction, qp_data.ineq.l, qp_data.ineq.u
+        ),
+    )
+
+    dtype = dx.dtype
+    direction_floor = jnp.asarray(10.0 * jnp.finfo(dtype).eps, dtype=dtype)
+    primal_infeasible_detected = (
+        (dy_norm > direction_floor)
+        & (primal_stationarity <= eps_prim_inf * dy_norm)
+        & (primal_support <= -eps_prim_inf * dy_norm)
+    )
+    dual_infeasible_detected = (
+        (dx_norm > direction_floor)
+        & (dual_hessian <= eps_dual_inf * dx_norm)
+        & (dual_objective <= -eps_dual_inf * dx_norm)
+        & (dual_direction_violation <= eps_dual_inf * dx_norm)
+    )
+    return _ADMMInfeasibilityDetection(
+        primal_infeasible_detected=primal_infeasible_detected,
+        dual_infeasible_detected=dual_infeasible_detected,
+    )
+
+
 def _update_rho(
     rho_bar: jnp.ndarray,
     residuals: ADMMResiduals,
     rho_min: float,
     rho_max: float,
+    rho_update_max_factor: float,
 ) -> jnp.ndarray:
     ratio = jnp.sqrt(
         residuals.primal_residual_normalized / residuals.dual_residual_normalized
     )
+    ratio = jnp.clip(ratio, 1.0 / rho_update_max_factor, rho_update_max_factor)
     rho_new = jnp.clip(rho_bar * ratio, rho_min, rho_max)
     return rho_new
 
@@ -406,12 +673,12 @@ def _update_residuals_and_rho(
     res_primals: jnp.ndarray,
     res_duals: jnp.ndarray,
     rhos_local: jnp.ndarray,
-    prim_terms: jnp.ndarray,
-    dual_terms: jnp.ndarray,
-    prim_margins: jnp.ndarray,
-    dual_margins: jnp.ndarray,
+    primal_limits: jnp.ndarray,
+    dual_limits: jnp.ndarray,
     pcg_iterations: jnp.ndarray,
     pcg_num_iterations: jnp.ndarray,
+    requires_preconditioner: bool,
+    use_slack_variables: bool,
 ) -> Tuple[
     ADMMResiduals,
     jnp.ndarray,
@@ -423,8 +690,9 @@ def _update_residuals_and_rho(
     jnp.ndarray,
     jnp.ndarray,
     jnp.ndarray,
-    jnp.ndarray,
 ]:
+    compute_schur = compute_S_Phiinv if requires_preconditioner else compute_S
+
     def _maybe_compute_residuals(should_check: jnp.ndarray) -> ADMMResiduals:
         return lax.cond(
             should_check,
@@ -438,6 +706,7 @@ def _update_residuals_and_rho(
                     z_g=z_g,
                     xi_g=xi_g,
                 ),
+                use_slack_variables=use_slack_variables,
             ),
             lambda _: residuals_prev,
             operand=None,
@@ -453,24 +722,20 @@ def _update_residuals_and_rho(
         jnp.ndarray,
         jnp.ndarray,
         jnp.ndarray,
-        jnp.ndarray,
-        jnp.ndarray,
     ]:
         def _update_stats(_):
-            primal_margin = (
+            primal_limit = (
                 params.eps_abs + params.eps_rel * residuals.primal_residual_norm_term
             )
-            dual_margin = (
+            dual_limit = (
                 params.eps_abs + params.eps_rel * residuals.dual_residual_norm_term
             )
             return (
                 res_primals.at[it].set(residuals.primal_residual),
                 res_duals.at[it].set(residuals.dual_residual),
-                rhos_local.at[it].set(state.rho_bar),
-                prim_terms.at[it].set(residuals.primal_residual_norm_term),
-                dual_terms.at[it].set(residuals.dual_residual_norm_term),
-                prim_margins.at[it].set(primal_margin),
-                dual_margins.at[it].set(dual_margin),
+                rhos_local,
+                primal_limits.at[it].set(primal_limit),
+                dual_limits.at[it].set(dual_limit),
                 pcg_iterations.at[it].set(pcg_num_iterations.astype(jnp.int32)),
             )
 
@@ -479,10 +744,8 @@ def _update_residuals_and_rho(
                 res_primals,
                 res_duals,
                 rhos_local,
-                prim_terms,
-                dual_terms,
-                prim_margins,
-                dual_margins,
+                primal_limits,
+                dual_limits,
                 pcg_iterations.at[it].set(pcg_num_iterations.astype(jnp.int32)),
             )
 
@@ -490,10 +753,17 @@ def _update_residuals_and_rho(
 
     def _maybe_update_rho_and_schur(
         should_check: jnp.ndarray, residuals: ADMMResiduals
-    ) -> Tuple[jnp.ndarray, SchurComplementMatrices]:
+    ) -> Tuple[jnp.ndarray, SchurComplementMatrices, jnp.ndarray]:
+        if params.adapt_rho_every <= 0:
+            return state.rho_bar, schur, jnp.asarray(False)
+
         def _update_rho_and_schur(_):
             rho_candidate = _update_rho(
-                state.rho_bar, residuals, params.rho_min, params.rho_max
+                state.rho_bar,
+                residuals,
+                params.rho_min,
+                params.rho_max,
+                params.rho_update_max_factor,
             )
             rhos_ratio = jnp.maximum(
                 rho_candidate / state.rho_bar, state.rho_bar / rho_candidate
@@ -510,7 +780,7 @@ def _update_residuals_and_rho(
             schur_new = lax.cond(
                 keep_rho,
                 lambda schur_in: schur_in,
-                lambda _: compute_S_Phiinv(
+                lambda _: compute_schur(
                     qp_data,
                     rho_new * params.rho_f_factor,
                     params.sigma,
@@ -518,40 +788,42 @@ def _update_residuals_and_rho(
                 ),
                 schur,
             )
-            return rho_new, schur_new
+            return rho_new, schur_new, jnp.logical_not(keep_rho)
 
         return lax.cond(
             should_check,
             _update_rho_and_schur,
-            lambda _: (state.rho_bar, schur),
+            lambda _: (state.rho_bar, schur, jnp.asarray(False)),
             operand=None,
         )
 
-    should_check = (it % params.check_termination_every) == 0
-    residuals = _maybe_compute_residuals(should_check)
+    should_check_termination = ((it % params.check_termination_every) == 0) | (
+        (it + 1) == params.max_iter
+    )
+    rhos_local = rhos_local.at[it].set(state.rho_bar)
+    residuals = _maybe_compute_residuals(should_check_termination)
     (
         res_primals,
         res_duals,
         rhos_local,
-        prim_terms,
-        dual_terms,
-        prim_margins,
-        dual_margins,
+        primal_limits,
+        dual_limits,
         pcg_iterations,
-    ) = _maybe_update_stats(should_check, residuals)
-    rho_new, schur = _maybe_update_rho_and_schur(should_check, residuals)
+    ) = _maybe_update_stats(should_check_termination, residuals)
+    rho_new, schur, refactorize = _maybe_update_rho_and_schur(
+        should_check_termination, residuals
+    )
 
     return (
         residuals,
         rho_new,
         schur,
+        refactorize,
         res_primals,
         res_duals,
         rhos_local,
-        prim_terms,
-        dual_terms,
-        prim_margins,
-        dual_margins,
+        primal_limits,
+        dual_limits,
         pcg_iterations,
     )
 
@@ -597,11 +869,17 @@ class ADMMSolver:
         rho_min: float = 1.0e-6,
         rho_max: float = 1.0e6,
         check_termination_every: int = 1,
+        check_infeasibility_every: int = 25,
         adapt_rho_every: int = 5,
         adaptive_rho_tolerance: float = 5.0,
+        rho_update_max_factor: float = 1.0e6,
         rho_f_factor: float = 1000.0,
         admm_backend: AdmmBackend = AdmmBackend.JAX_LOOP,
-        use_slack: bool = False,
+        use_slack_variables: bool = False,
+        eps_prim_inf: float = 1.0e-4,
+        eps_dual_inf: float = 1.0e-4,
+        constraint_handling: ConstraintHandling = ConstraintHandling.PROJECTION,
+        log_barrier_kappa: float = 0.0,
     ):
         if admm_backend == AdmmBackend.JAX_LOOP and schur_solver is None:
             raise ValueError("admm_backend=JAX_LOOP requires schur_solver")
@@ -614,12 +892,39 @@ class ADMMSolver:
         self._rho_min = float(rho_min)
         self._rho_max = float(rho_max)
         self._check_termination_every = int(check_termination_every)
+        self._check_infeasibility_every = int(check_infeasibility_every)
         self._adapt_rho_every = int(adapt_rho_every)
+        if self._max_iter < 1:
+            raise ValueError("max_iter must be at least 1")
+        if self._check_termination_every < 1:
+            raise ValueError("check_termination_every must be at least 1")
+        if self._check_infeasibility_every < 1:
+            raise ValueError("check_infeasibility_every must be at least 1")
         self._adaptive_rho_tolerance = float(adaptive_rho_tolerance)
+        self._rho_update_max_factor = float(rho_update_max_factor)
+        if isnan(self._rho_update_max_factor) or self._rho_update_max_factor < 1.0:
+            raise ValueError("rho_update_max_factor must be at least 1.0")
         self._rho_f_factor = float(rho_f_factor)
         self._admm_backend = admm_backend
-        self._use_slack = bool(use_slack)
+        self._use_slack_variables = bool(use_slack_variables)
+        self._eps_prim_inf = float(eps_prim_inf)
+        self._eps_dual_inf = float(eps_dual_inf)
+        if not isfinite(self._eps_prim_inf) or self._eps_prim_inf < 0.0:
+            raise ValueError("eps_prim_inf must be finite and nonnegative")
+        if not isfinite(self._eps_dual_inf) or self._eps_dual_inf < 0.0:
+            raise ValueError("eps_dual_inf must be finite and nonnegative")
+        self._constraint_handling = ConstraintHandling(constraint_handling)
+        self._log_barrier_kappa = float(log_barrier_kappa)
+        if self._constraint_handling == ConstraintHandling.LOG_BARRIER:
+            if not isfinite(self._log_barrier_kappa) or self._log_barrier_kappa <= 0.0:
+                raise ValueError(
+                    "log_barrier_kappa must be positive and finite for "
+                    "log-barrier handling"
+                )
+        elif self._log_barrier_kappa != 0.0:
+            raise ValueError("log_barrier_kappa must be zero for projection handling")
         self._zshape = zshape
+        self._cudss_workspace = None
 
     @property
     def schur_solver(self) -> Optional[SchurSystemSolver]:
@@ -654,12 +959,20 @@ class ADMMSolver:
         return self._check_termination_every
 
     @property
+    def check_infeasibility_every(self) -> int:
+        return self._check_infeasibility_every
+
+    @property
     def adapt_rho_every(self) -> int:
         return self._adapt_rho_every
 
     @property
     def adaptive_rho_tolerance(self) -> float:
         return self._adaptive_rho_tolerance
+
+    @property
+    def rho_update_max_factor(self) -> float:
+        return self._rho_update_max_factor
 
     @property
     def rho_f_factor(self) -> float:
@@ -669,19 +982,50 @@ class ADMMSolver:
     def admm_backend(self) -> AdmmBackend:
         return self._admm_backend
 
+    @property
+    def constraint_handling(self) -> ConstraintHandling:
+        return self._constraint_handling
+
+    @property
+    def log_barrier_kappa(self) -> float:
+        return self._log_barrier_kappa
+
+    @property
+    def _detects_infeasibility(self) -> bool:
+        """Hard-QP infeasibility certificates only apply to projection."""
+        return self._constraint_handling == ConstraintHandling.PROJECTION
+
+    def _inequality_update(
+        self,
+        ineq: QPInequalityBlocks,
+        z_tilde: jnp.ndarray,
+        rho_bar: jnp.ndarray,
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """Apply the configured inequality proximal update to ``z_tilde``."""
+        if self._constraint_handling == ConstraintHandling.LOG_BARRIER:
+            return _log_barrier_inequality_update(
+                z_tilde,
+                ineq,
+                rho_bar,
+                self._log_barrier_kappa,
+                use_slack_variables=self._use_slack_variables,
+            )
+        return _projection_inequality_update(
+            z_tilde,
+            ineq,
+            rho_bar,
+            use_slack_variables=self._use_slack_variables,
+        )
+
     def solve(
         self,
         qp_data: QPData,
         admm_state0: Optional[ADMMState] = None,
         rho_bar: float = 1.0,
         alpha: float = 1.0,
-        *,
-        slack_weight: float = 0.0,
-    ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], ADMMStats, ADMMState]:
+    ) -> ADMMResult:
         if self._admm_backend != AdmmBackend.JAX_LOOP:
-            return self._solve_fused(
-                qp_data, admm_state0, rho_bar, alpha, slack_weight=slack_weight
-            )
+            return self._solve_fused(qp_data, admm_state0, rho_bar, alpha)
         return self._solve_jax_loop(qp_data, admm_state0, rho_bar, alpha)
 
     def _solve_fused(
@@ -690,13 +1034,8 @@ class ADMMSolver:
         admm_state0: Optional[ADMMState] = None,
         rho_bar: float = 1.0,
         alpha: float = 1.0,
-        *,
-        slack_weight: float = 0.0,
-    ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], ADMMStats, ADMMState]:
-        """ADMM solve via fused CUDA mega-kernel (single FFI call).
-
-        Replaces the entire JAX while_loop ADMM with one kernel launch.
-        """
+    ) -> ADMMResult:
+        """Run fused ADMM with the same termination rules as the JAX loop."""
         params = ADMMParams(
             sigma=self.sigma,
             max_iter=self.max_iter,
@@ -707,8 +1046,12 @@ class ADMMSolver:
             check_termination_every=self._check_termination_every,
             adapt_rho_every=self._adapt_rho_every,
             adaptive_rho_tolerance=self._adaptive_rho_tolerance,
+            rho_update_max_factor=self._rho_update_max_factor,
             rho_f_factor=self._rho_f_factor,
             alpha=alpha,
+            eps_prim_inf=self._eps_prim_inf,
+            eps_dual_inf=self._eps_dual_inf,
+            check_infeasibility_every=self._check_infeasibility_every,
         )
 
         if admm_state0 is None:
@@ -716,7 +1059,12 @@ class ADMMSolver:
         else:
             state0 = admm_state0
 
-        schur = compute_S_Phiinv(
+        compute_schur = (
+            compute_S_Phiinv
+            if self._admm_backend == AdmmBackend.FUSED_PCG
+            else compute_S
+        )
+        schur = compute_schur(
             qp_data,
             state0.rho_bar * params.rho_f_factor,
             params.sigma,
@@ -724,73 +1072,73 @@ class ADMMSolver:
         )
 
         if self._admm_backend == AdmmBackend.FUSED_PCG:
-            from turbompc.solvers.admm.admm_ffi_backend import admm_ffi_solve_single
+            from turbompc.solvers.admm.admm_ffi_backend import admm_ffi_solve
 
-            result = admm_ffi_solve_single(
+            result = admm_ffi_solve(
                 qp_data,
                 schur,
                 state0,
                 max_iter=params.max_iter,
                 pcg_max_iter=int(self._pcg_params.get("max_iter", 200)),
-                check_every=params.check_termination_every,
+                check_termination_every=params.check_termination_every,
+                check_infeasibility_every=params.check_infeasibility_every,
                 eps_abs=params.eps_abs,
                 eps_rel=params.eps_rel,
+                eps_prim_inf=params.eps_prim_inf,
+                eps_dual_inf=params.eps_dual_inf,
                 sigma=params.sigma,
                 rho_f_factor=params.rho_f_factor,
                 alpha=params.alpha,
                 pcg_eps=float(self._pcg_params.get("tol_epsilon", 1e-8)),
                 adapt_rho_every=params.adapt_rho_every,
                 adaptive_rho_tolerance=params.adaptive_rho_tolerance,
+                rho_update_max_factor=params.rho_update_max_factor,
                 rho_min=params.rho_min,
                 rho_max=params.rho_max,
-                slack_weight=slack_weight,
-                use_slack=self._use_slack,
-            )
-        elif self._admm_backend == AdmmBackend.FUSED_CUDSS:
-            from turbompc.solvers.admm.admm_cudss_ffi_backend import (
-                admm_cudss_ffi_solve_single,
+                slack_weight=qp_data.ineq.slack_penalization_weight,
+                use_slack=self._use_slack_variables,
+                constraint_handling=self._constraint_handling,
+                log_barrier_kappa=self._log_barrier_kappa,
             )
 
-            result = admm_cudss_ffi_solve_single(
+        elif self._admm_backend == AdmmBackend.FUSED_CUDSS:
+            from turbompc.solvers.admm.admm_cudss_ffi_backend import (
+                AdmmCudssWorkspace,
+                admm_cudss_ffi_solve,
+            )
+
+            if self._cudss_workspace is None:
+                self._cudss_workspace = AdmmCudssWorkspace()
+
+            result = admm_cudss_ffi_solve(
                 qp_data,
                 schur,
                 state0,
+                workspace=self._cudss_workspace,
                 max_iter=params.max_iter,
-                check_every=params.check_termination_every,
+                check_termination_every=params.check_termination_every,
+                check_infeasibility_every=params.check_infeasibility_every,
                 adapt_rho_every=params.adapt_rho_every,
                 eps_abs=params.eps_abs,
                 eps_rel=params.eps_rel,
+                eps_prim_inf=params.eps_prim_inf,
+                eps_dual_inf=params.eps_dual_inf,
                 sigma=params.sigma,
                 rho_f_factor=params.rho_f_factor,
                 alpha=params.alpha,
                 adaptive_rho_tolerance=params.adaptive_rho_tolerance,
+                rho_update_max_factor=params.rho_update_max_factor,
                 rho_min=params.rho_min,
                 rho_max=params.rho_max,
-                slack_weight=slack_weight,
-                use_slack=self._use_slack,
+                slack_weight=qp_data.ineq.slack_penalization_weight,
+                use_slack=self._use_slack_variables,
+                constraint_handling=self._constraint_handling,
+                log_barrier_kappa=self._log_barrier_kappa,
             )
+
         else:
             raise ValueError(f"Unknown ADMM backend: {self._admm_backend}")
-
-        # Unpack x_blocks → (states, controls) to match _solve_jax_loop interface
-        states, controls = unpack_x(result.state.x_blocks, self._zshape)
-
-        # Minimal stats (fused kernel doesn't track per-iter residuals)
-        dtype = qp_data.cost.q.dtype
-        max_iter = params.max_iter
-        empty = jnp.zeros((max_iter,), dtype=dtype)
-        stats = ADMMStats(
-            primal_residuals=empty,
-            dual_residuals=empty,
-            primal_residual_norm_terms=empty,
-            dual_residual_norm_terms=empty,
-            primal_residual_margins=empty,
-            dual_residual_margins=empty,
-            num_pcg_iters=jnp.zeros((max_iter,), dtype=jnp.int32),
-            num_iter=result.iters_out,
-            rhos=empty,
-        )
-        return (states, controls), stats, result.state
+        return ADMMResult(state=result.state, stats=result.stats, iterations=None)
 
     def _solve_jax_loop(
         self,
@@ -798,7 +1146,7 @@ class ADMMSolver:
         admm_state0: Optional[ADMMState] = None,
         rho_bar: float = 1.0,
         alpha: float = 1.0,
-    ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], ADMMStats, ADMMState]:
+    ) -> ADMMResult:
         schur_solver = self._schur_solver
         if schur_solver is None:
             raise RuntimeError("Missing schur_solver for admm_backend=JAX_LOOP")
@@ -812,8 +1160,12 @@ class ADMMSolver:
             check_termination_every=self._check_termination_every,
             adapt_rho_every=self._adapt_rho_every,
             adaptive_rho_tolerance=self._adaptive_rho_tolerance,
+            rho_update_max_factor=self._rho_update_max_factor,
             rho_f_factor=self._rho_f_factor,
             alpha=alpha,
+            eps_prim_inf=self._eps_prim_inf,
+            eps_dual_inf=self._eps_dual_inf,
+            check_infeasibility_every=self._check_infeasibility_every,
         )
 
         if admm_state0 is None:
@@ -824,7 +1176,10 @@ class ADMMSolver:
         else:
             state0 = admm_state0
 
-        schur = compute_S_Phiinv(
+        compute_schur = (
+            compute_S_Phiinv if schur_solver.requires_preconditioner else compute_S
+        )
+        schur = compute_schur(
             qp_data,
             state0.rho_bar * params.rho_f_factor,
             params.sigma,
@@ -833,37 +1188,31 @@ class ADMMSolver:
         dtype = qp_data.cost.q.dtype
         primals = jnp.zeros((params.max_iter,), dtype=dtype)
         duals = jnp.zeros((params.max_iter,), dtype=dtype)
-        prim_terms = jnp.zeros((params.max_iter,), dtype=dtype)
-        dual_terms = jnp.zeros((params.max_iter,), dtype=dtype)
-        prim_margins = jnp.zeros((params.max_iter,), dtype=dtype)
-        dual_margins = jnp.zeros((params.max_iter,), dtype=dtype)
+        primal_limits = jnp.zeros((params.max_iter,), dtype=dtype)
+        dual_limits = jnp.zeros((params.max_iter,), dtype=dtype)
         pcg_iters = jnp.zeros((params.max_iter,), dtype=jnp.int32)
         rhos = jnp.zeros((params.max_iter,), dtype=dtype)
+        detect_infeasibility = self._detects_infeasibility
 
         def cond_fun(carry):
-            it, _, _, _, _, _, _, _, _, _, _, residuals = carry
-            should_check = (it % params.check_termination_every) == 0
-            too_large = _residuals_too_large(residuals, params.eps_abs, params.eps_rel)
-            not_maxed = it < params.max_iter
-            keep_going = jnp.logical_or(jnp.logical_not(should_check), too_large)
-            _continue = jnp.logical_and(not_maxed, keep_going)
-            _continue = jnp.logical_or(_continue, it < 1)
-            return _continue
+            it, _, _, _, _, _, _, _, _, _, _, status, _ = carry
+            return (it < params.max_iter) & (status == jnp.int32(ADMMStatus.NOT_RUN))
 
         def body_fun(carry):
             (
                 it,
                 state,
                 schur,
+                refactorize,
                 res_primals,
                 res_duals,
                 rhos_local,
-                prim_terms,
-                dual_terms,
-                prim_margins,
-                dual_margins,
+                primal_limits,
+                dual_limits,
                 pcg_iters,
                 residuals_prev,
+                _,
+                certificate_prev,
             ) = carry
 
             rho_f = state.rho_bar * params.rho_f_factor
@@ -880,7 +1229,9 @@ class ADMMSolver:
             )
 
             zs_guess = state.x_blocks
-            x_blocks, pcg_debug = schur_solver.solve(schur, gammas, zs_guess)
+            x_blocks, pcg_debug = schur_solver.solve(
+                schur, gammas, zs_guess, factorize=refactorize
+            )
             Cx0, Cx = _apply_C_parts(qp_data, x_blocks)
             c0 = qp_data.eq.c0
             c = qp_data.eq.c
@@ -904,19 +1255,9 @@ class ADMMSolver:
                     + (1.0 - alpha) * state.z_g
                     + state.y_g / state.rho_bar
                 )
-                proj = _project_box(
-                    z_tilde,
-                    qp_data.ineq.l,
-                    qp_data.ineq.u,
+                z_g, xi_g = self._inequality_update(
+                    qp_data.ineq, z_tilde, state.rho_bar
                 )
-                if qp_data.ineq.use_slack_variables:
-                    gamma = qp_data.ineq.slack_penalization_weight
-                    frac = gamma / (gamma + state.rho_bar)
-                    z_g = (1.0 - frac) * z_tilde + frac * proj
-                    xi_g = (state.rho_bar / (gamma + state.rho_bar)) * (proj - z_tilde)
-                else:
-                    z_g = proj
-                    xi_g = jnp.zeros_like(z_g)
             # -------------------------------------
 
             # -------------------------------------
@@ -937,13 +1278,12 @@ class ADMMSolver:
                 residuals,
                 rho_new,
                 schur,
+                refactorize,
                 res_primals,
                 res_duals,
                 rhos_local,
-                prim_terms,
-                dual_terms,
-                prim_margins,
-                dual_margins,
+                primal_limits,
+                dual_limits,
                 pcg_iters,
             ) = _update_residuals_and_rho(
                 it=it,
@@ -960,13 +1300,13 @@ class ADMMSolver:
                 res_primals=res_primals,
                 res_duals=res_duals,
                 rhos_local=rhos_local,
-                prim_terms=prim_terms,
-                dual_terms=dual_terms,
-                prim_margins=prim_margins,
-                dual_margins=dual_margins,
+                primal_limits=primal_limits,
+                dual_limits=dual_limits,
                 pcg_iterations=pcg_iters,
                 pcg_num_iterations=pcg_debug.num_iterations,
                 xi_g=xi_g,
+                requires_preconditioner=schur_solver.requires_preconditioner,
+                use_slack_variables=self._use_slack_variables,
             )
 
             next_state = ADMMState(
@@ -978,44 +1318,115 @@ class ADMMSolver:
                 xi_g=xi_g,
                 rho_bar=rho_new,
             )
+            should_check_termination = ((it % params.check_termination_every) == 0) | (
+                (it + 1) == params.max_iter
+            )
+            if detect_infeasibility:
+                should_check_infeasibility = (
+                    (it % params.check_infeasibility_every) == 0
+                ) | ((it + 1) == params.max_iter)
+                residuals = lax.cond(
+                    should_check_infeasibility & ~should_check_termination,
+                    lambda _: _compute_residuals(
+                        qp_data,
+                        next_state,
+                        use_slack_variables=self._use_slack_variables,
+                    ),
+                    lambda _: residuals,
+                    operand=None,
+                )
+                certificate = lax.cond(
+                    should_check_infeasibility,
+                    lambda _: _compute_infeasibility_certificates(
+                        qp_data,
+                        state,
+                        next_state,
+                        params.eps_prim_inf,
+                        params.eps_dual_inf,
+                        use_slack_variables=self._use_slack_variables,
+                    ),
+                    lambda _: certificate_prev,
+                    operand=None,
+                )
+            else:
+                should_check_infeasibility = jnp.asarray(False)
+                certificate = certificate_prev
+            should_check_status = should_check_termination | should_check_infeasibility
+            residuals_finite = (
+                jnp.isfinite(residuals.primal_residual)
+                & jnp.isfinite(residuals.dual_residual)
+                & jnp.isfinite(residuals.primal_residual_norm_term)
+                & jnp.isfinite(residuals.dual_residual_norm_term)
+            )
+            finite = residuals_finite & tree_all_finite(next_state)
+            converged = (
+                should_check_termination
+                & finite
+                & ~_residuals_too_large(residuals, params.eps_abs, params.eps_rel)
+            )
+            status = _select_admm_status(
+                nonfinite=should_check_status & ~finite,
+                solved=converged,
+                primal_infeasible=(
+                    should_check_infeasibility & certificate.primal_infeasible_detected
+                ),
+                dual_infeasible=(
+                    should_check_infeasibility & certificate.dual_infeasible_detected
+                ),
+                iteration_limit_reached=(it + 1) >= params.max_iter,
+            )
+            # Rho updates prepare a subsequent iteration.  Keep the rho used by the
+            # final iterate when this check terminates the solve.
+            next_state = next_state._replace(
+                rho_bar=jnp.where(
+                    status == jnp.int32(ADMMStatus.NOT_RUN),
+                    next_state.rho_bar,
+                    state.rho_bar,
+                )
+            )
             it_next = it + 1
             return (
                 it_next,
                 next_state,
                 schur,
+                refactorize,
                 res_primals,
                 res_duals,
                 rhos_local,
-                prim_terms,
-                dual_terms,
-                prim_margins,
-                dual_margins,
+                primal_limits,
+                dual_limits,
                 pcg_iters,
                 residuals,
+                status,
+                certificate,
             )
 
-        it0 = jnp.array(0)
+        it0 = jnp.asarray(0, dtype=jnp.int32)
         init_residuals = ADMMResiduals(
-            primal_residual=jnp.array(jnp.inf),
-            dual_residual=jnp.array(jnp.inf),
-            primal_residual_normalized=jnp.array(jnp.inf),
-            dual_residual_normalized=jnp.array(jnp.inf),
-            primal_residual_norm_term=jnp.array(1.0),
-            dual_residual_norm_term=jnp.array(1.0),
+            primal_residual=jnp.asarray(jnp.inf, dtype=dtype),
+            dual_residual=jnp.asarray(jnp.inf, dtype=dtype),
+            primal_residual_normalized=jnp.asarray(jnp.inf, dtype=dtype),
+            dual_residual_normalized=jnp.asarray(jnp.inf, dtype=dtype),
+            primal_residual_norm_term=jnp.asarray(1.0, dtype=dtype),
+            dual_residual_norm_term=jnp.asarray(1.0, dtype=dtype),
+        )
+        init_certificate = _ADMMInfeasibilityDetection(
+            jnp.asarray(False), jnp.asarray(False)
         )
         (
             it,
             state,
             _,
+            _,
             res_primals,
             res_duals,
             rhos,
-            prim_terms,
-            dual_terms,
-            prim_margins,
-            dual_margins,
+            primal_limits,
+            dual_limits,
             pcg_iters,
-            _,
+            residuals,
+            status,
+            certificate,
         ) = lax.while_loop(
             cond_fun,
             body_fun,
@@ -1023,30 +1434,44 @@ class ADMMSolver:
                 it0,
                 state0,
                 schur,
+                jnp.asarray(True),
                 primals,
                 duals,
                 rhos,
-                prim_terms,
-                dual_terms,
-                prim_margins,
-                dual_margins,
+                primal_limits,
+                dual_limits,
                 pcg_iters,
                 init_residuals,
+                jnp.int32(ADMMStatus.NOT_RUN),
+                init_certificate,
             ),
         )
-        stats = ADMMStats(
+        stats = _make_admm_stats(
+            status,
+            it,
+            residuals,
+            params.eps_abs,
+            params.eps_rel,
+        )
+        indices = jnp.arange(params.max_iter)
+        residuals_valid = ((indices % params.check_termination_every) == 0) & (
+            indices < it
+        )
+        residuals_valid = residuals_valid | (
+            (indices == (it - 1)) & (it == params.max_iter)
+        )
+        iterations = ADMMIterationStats(
+            residuals_valid=residuals_valid,
             primal_residuals=res_primals,
             dual_residuals=res_duals,
-            primal_residual_norm_terms=prim_terms,
-            dual_residual_norm_terms=dual_terms,
-            primal_residual_margins=prim_margins,
-            dual_residual_margins=dual_margins,
-            num_pcg_iters=pcg_iters,
-            num_iter=it,
+            primal_residual_limits=primal_limits,
+            dual_residual_limits=dual_limits,
             rhos=rhos,
+            linear_solver_iterations=(
+                pcg_iters if schur_solver.requires_preconditioner else None
+            ),
         )
-        states, controls = unpack_x(state.x_blocks, self._zshape)
-        return (states, controls), stats, state
+        return ADMMResult(state=state, stats=stats, iterations=iterations)
 
     def initial_state(
         self,
@@ -1073,8 +1498,17 @@ class ADMMSolver:
             xi_g0 = jnp.zeros_like(z_g0)
         else:
             ineq_vals = vmap(lambda G, z: G @ z)(qp_data.ineq.G, x_blocks0)  # (N+1, m)
-            proj = _project_box(ineq_vals, qp_data.ineq.l, qp_data.ineq.u)  # (N+1, m)
-            z_g0 = proj
+            if self._constraint_handling == ConstraintHandling.LOG_BARRIER:
+                z_g0 = prox_two_sided_log_barrier(
+                    ineq_vals,
+                    qp_data.ineq.l,
+                    qp_data.ineq.u,
+                    jnp.asarray(self._log_barrier_kappa / rho_bar, dtype=dtype),
+                )  # (N+1, m)
+            else:
+                z_g0 = _project_box(
+                    ineq_vals, qp_data.ineq.l, qp_data.ineq.u
+                )  # (N+1, m)
             xi_g0 = jnp.zeros_like(z_g0)
             y_g0 = jnp.zeros_like(z_g0)
         return ADMMState(

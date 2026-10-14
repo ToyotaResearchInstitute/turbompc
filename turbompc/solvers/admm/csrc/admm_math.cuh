@@ -163,9 +163,9 @@ __device__ void overRelaxDevice(
 
 
 // z_tilde = alpha * Gx + (1-alpha) * z_old + y_g / rho_bar
-// z_g     = clamp(z_tilde, l, u)        (with optional slack penalty)
+// z_g     = clamp(z_tilde, l, u)   (relaxed toward z_tilde when use_slack)
 template<typename T>
-__device__ void slackUpdateDevice(
+__device__ void projectionUpdateDevice(
     T* __restrict__ z_g,              // [T*m] updated in-place
     const T* __restrict__ scratch_Gx, // [T*m] inequality values
     const T* __restrict__ y_g,        // [T*m] inequality dual
@@ -193,6 +193,129 @@ __device__ void slackUpdateDevice(
                 xi_g[i] = (rho_bar / (slack_weight + rho_bar)) * (clamped - z_tilde);
             } else {
                 z_g[i] = clamped;
+                xi_g[i] = T(0);
+            }
+        }
+    }
+    __syncthreads();
+}
+
+
+// ---- Two-sided log-barrier proximal operator ----
+// Mirrors turbompc/solvers/admm/inequality_log_barrier.py
+constexpr int LOG_BARRIER_NEWTON_STEPS = 7;
+constexpr double LOG_BARRIER_FRACTION_TO_BOUNDARY = 0.99;
+
+// Stable (offset + sqrt(offset^2 + 4*kappa)) / 2.
+template<typename T>
+__device__ inline T positiveQuadraticRootDevice(T offset, T kappa)
+{
+    T root = sqrt(offset * offset + T(4) * kappa);
+    return offset >= T(0) ? T(0.5) * (offset + root)
+                          : T(2) * kappa / (root - offset);
+}
+
+// Round a mathematically interior value toward a representable interior.
+template<typename T>
+__device__ inline T strictlyBetweenDevice(T value, T lower, T upper)
+{
+    T interior_lower = nextafter(lower, upper);
+    T interior_upper = nextafter(upper, lower);
+    if (value < interior_lower) value = interior_lower;
+    if (value > interior_upper) value = interior_upper;
+    return value;
+}
+
+// Proximal operator of -kappa*log(w-l) - kappa*log(u-w) for finite bounds.
+template<typename T>
+__device__ inline T finiteTwoSidedLogBarrierProxDevice(T v, T lower, T upper, T kappa)
+{
+    const T tau = T(LOG_BARRIER_FRACTION_TO_BOUNDARY);
+    // g(midpoint) = midpoint - v puts the root on v's side of the midpoint,
+    // where the nearer bound's one-sided prox approximates it.
+    const T midpoint = lower + T(0.5) * (upper - lower);
+    T value = v <= midpoint
+        ? fmin(lower + positiveQuadraticRootDevice(v - lower, kappa), midpoint)
+        : fmax(upper - positiveQuadraticRootDevice(upper - v, kappa), midpoint);
+    value = strictlyBetweenDevice(value, lower, upper);
+
+    for (int step_index = 0; step_index < LOG_BARRIER_NEWTON_STEPS; ++step_index) {
+        T lower_clearance = value - lower;
+        T upper_clearance = upper - value;
+        T residual = value - v + kappa * (T(1) / upper_clearance - T(1) / lower_clearance);
+        T derivative = T(1) + kappa * (
+            T(1) / (upper_clearance * upper_clearance)
+            + T(1) / (lower_clearance * lower_clearance));
+        T step = -residual / derivative;
+        T alpha = T(1);
+        if (step < T(0)) {
+            T limit = tau * lower_clearance / (-step);
+            if (limit < alpha) alpha = limit;
+        } else if (step > T(0)) {
+            T limit = tau * upper_clearance / step;
+            if (limit < alpha) alpha = limit;
+        }
+        value = strictlyBetweenDevice(value + alpha * step, lower, upper);
+    }
+    return value;
+}
+
+// Infinite bounds select the corresponding one-sided closed form; an element
+// with two infinite bounds is returned unchanged.
+template<typename T>
+__device__ inline T proxTwoSidedLogBarrierDevice(T v, T lower, T upper, T kappa)
+{
+    bool finite_lower = isfinite(lower);
+    bool finite_upper = isfinite(upper);
+    if (finite_lower && finite_upper)
+        return finiteTwoSidedLogBarrierProxDevice(v, lower, upper, kappa);
+    if (finite_lower) {
+        T value = lower + positiveQuadraticRootDevice(v - lower, kappa);
+        T floor_value = nextafter(lower, T(INFINITY));
+        return value > floor_value ? value : floor_value;
+    }
+    if (finite_upper) {
+        T value = upper - positiveQuadraticRootDevice(upper - v, kappa);
+        T ceil_value = nextafter(upper, T(-INFINITY));
+        return value < ceil_value ? value : ceil_value;
+    }
+    return v;
+}
+
+
+// z_tilde = alpha * Gx + (1-alpha) * z_old + y_g / rho_bar
+// pure:     z_g  = prox(z_tilde, l, u, kappa/rho),   xi_g = 0
+// relaxed:  w    = prox(z_tilde, l, u, kappa*(1/rho + 1/gamma))
+//           xi_g = rho/(rho + gamma) * (w - z_tilde),  z_g = w - xi_g
+template<typename T>
+__device__ void logBarrierUpdateDevice(
+    T* __restrict__ z_g,              // [T*m] updated in-place
+    const T* __restrict__ scratch_Gx, // [T*m] inequality values
+    const T* __restrict__ y_g,        // [T*m] inequality dual
+    const T* __restrict__ l_g,        // [T*m] lower bounds
+    const T* __restrict__ u_g,        // [T*m] upper bounds
+    T alpha, T rho_bar,
+    int T_blocks, int m,
+    T log_barrier_kappa, T slack_weight, bool use_slack, T* __restrict__ xi_g)
+{
+    int tid = threadIdx.x;
+    int total_Tm = T_blocks * m;
+
+    if (m > 0) {
+        T prox_kappa = use_slack
+            ? log_barrier_kappa * (T(1) / rho_bar + T(1) / slack_weight)
+            : log_barrier_kappa / rho_bar;
+        for (int i = tid; i < total_Tm; i += blockDim.x) {
+            T z_old = z_g[i];
+            T z_tilde = alpha * scratch_Gx[i] + (T(1) - alpha) * z_old + y_g[i] / rho_bar;
+            T w = proxTwoSidedLogBarrierDevice(z_tilde, l_g[i], u_g[i], prox_kappa);
+            if (use_slack) {
+                T xi = (rho_bar / (rho_bar + slack_weight)) * (w - z_tilde);
+                z_g[i] = w - xi;
+                xi_g[i] = xi;
+            } else {
+                z_g[i] = w;
+                xi_g[i] = T(0);
             }
         }
     }
@@ -311,15 +434,18 @@ __device__ void invertSmallMatrixDevice(
 
 // OSQP-style adaptive rho:
 //   ratio = sqrt(p_norm / d_norm)
-//   rho'  = clip(rho_old * ratio, [rho_min, rho_max])
+//   multiplier = clip(ratio, [1/max_factor, max_factor])
+//   rho'  = clip(rho_old * multiplier, [rho_min, rho_max])
 //   returns max(rho'/rho_old, rho_old/rho') >= tolerance; writes rho' out.
 template<typename T>
 __device__ inline bool computeRhoCandidateDevice(
     T p_norm, T d_norm, T rho_old,
-    T rho_min, T rho_max, T tolerance,
+    T max_factor, T rho_min, T rho_max, T tolerance,
     T* __restrict__ rho_new_out)
 {
     T ratio = sqrt(p_norm / (d_norm + T(1e-30)));
+    if (ratio < T(1) / max_factor) ratio = T(1) / max_factor;
+    if (ratio > max_factor) ratio = max_factor;
     T rho_candidate = rho_old * ratio;
     if (rho_candidate < rho_min) rho_candidate = rho_min;
     if (rho_candidate > rho_max) rho_candidate = rho_max;

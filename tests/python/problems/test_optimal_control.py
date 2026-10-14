@@ -2,11 +2,13 @@
 
 import jax.numpy as jnp
 import pytest
+
 from tests.helpers.problem_fixtures import tile_spacecraft_inertia
 from tests.helpers.solver_fixtures import sqp_params
 from turbompc.dynamics.spacecraft_dynamics import SpacecraftDynamics
 from turbompc.problems.optimal_control_problem import OptimalControlProblem
-from turbompc.solvers.sqp_diffmpc import SolverReturnStatus, SQPDiffMPCSolver
+from turbompc.solvers.sqp_diffmpc import SQPDiffMPCSolver
+from turbompc.solvers.status import SQPStatus
 from turbompc.utils.load_params import load_problem_params
 
 
@@ -35,7 +37,7 @@ def test_spacecraft_with_sqp_solver(spacecraft_problem_params, solver_parameters
     sol = solver.solve(solver.initial_guess(), problem.params)
     convergence_error, status = sol.convergence_error, sol.status
     assert convergence_error < 2e-5
-    assert SolverReturnStatus(status) is SolverReturnStatus.SUCCESS
+    assert SQPStatus(status) is SQPStatus.SOLVED
 
 
 def test_legacy_final_state_alias_sets_initial_guess_target(spacecraft_problem_params):

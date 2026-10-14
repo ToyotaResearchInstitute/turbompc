@@ -17,6 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV PATH="/usr/local/cuda/bin:${PATH}"
 ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
 
+ARG ACADOS_REF=v0.6.0
+
 # Create venv
 RUN python3.10 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
@@ -27,11 +29,11 @@ RUN pip install --upgrade pip setuptools wheel
 COPY requirements.txt /tmp/
 RUN pip install -r /tmp/requirements.txt
 
-# Clone and build acados (matching local version)
+# Clone and build acados
 WORKDIR /opt
 RUN git clone https://github.com/acados/acados.git && \
     cd acados && \
-    git checkout 17625e2cd && \
+    git checkout ${ACADOS_REF} && \
     git submodule update --init --recursive
 
 # Build acados with OpenMP enabled
@@ -47,6 +49,9 @@ ENV LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$ACADOS_SOURCE_DIR/lib"
 # Install acados Python interface
 WORKDIR /opt/acados/interfaces/acados_template
 RUN pip install -e .
+
+# Install the Tera template renderer while the image is writable
+RUN python -c "from acados_template.utils import get_tera; print(get_tera())"
 
 # Clone differentiable_nmpc
 RUN git clone https://github.com/FreyJo/differentiable_nmpc.git /opt/differentiable_nmpc

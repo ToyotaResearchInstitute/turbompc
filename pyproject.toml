@@ -1,6 +1,15 @@
 [build-system]
-requires = ["setuptools>=64"]
-build-backend = "setuptools.build_meta"
+requires = [
+    "scikit-build-core>=0.10",
+    "pybind11>=2.10",
+    "jaxlib==0.6.2",
+    "packaging>=22.0",
+]
+
+# Wrapper around scikit_build_core.build to build CMake.
+# https://github.com/scikit-build/scikit-build-core
+build-backend = "turbompc_build"
+backend-path = ["."]
 
 [project]
 name = "turbompc"
@@ -12,22 +21,44 @@ authors = [
     {name = "TurboMPC team", email = "thomas.lew@tri.global"},
 ]
 dependencies = [
-    "jax>=0.4.20",
-    "jaxlib>=0.4.20",
+    "jax>=0.6.2,<0.7",
+    "jaxlib>=0.6.2,<0.7",
     "numpy>=1.17.4",
     "osqp==0.6.7.post3",
     "scipy",
     "pyyaml",
-]
-
-[project.optional-dependencies]
-dev = [
     "pytest",
     "matplotlib",
 ]
 
-[tool.setuptools.packages.find]
-include = ["turbompc*"]
+[project.optional-dependencies]
+cuda12 = [
+    "jax[cuda12]>=0.6.2,<0.7",
+    "nvidia-cusparse-cu12",
+    "nvidia-cudss-cu12>=0.8",
+]
+gpu = ["turbompc[cuda12]"]
+rl = ["torch", "diffrax>=0.6.2"]
+
+[project.scripts]
+turbompc-check = "turbompc._check_install:main"
+
+[tool.scikit-build]
+minimum-version = "0.10"
+cmake.version = ">=3.20"
+
+# Persisting it keeps incremental rebuilds fast across repeated pip installs.
+build-dir = "build/skbuild/{wheel_tag}"
+wheel.packages = ["turbompc"]
+
+cmake.define.TURBOMPC_POST_BUILD_CHECK = "OFF"
+sdist.exclude = [
+    "benchmarking",
+    "build",
+    "docs/figs",
+    "examples",
+    "tests",
+]
 
 [tool.pytest.ini_options]
 testpaths = [

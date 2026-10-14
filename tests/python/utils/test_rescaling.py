@@ -2,6 +2,7 @@ import copy
 
 import jax.numpy as jnp
 import numpy as np
+
 from turbompc.dynamics.linear_dynamics import (
     LinearDynamics,
     default_state_dot_parameters,

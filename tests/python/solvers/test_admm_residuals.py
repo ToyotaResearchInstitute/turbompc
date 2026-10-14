@@ -1,3 +1,4 @@
+from dataclasses import replace
 from typing import Tuple
 
 import jax
@@ -6,20 +7,23 @@ import numpy as np
 import osqp
 import pytest
 import scipy.sparse as sp
+
 from tests.helpers.problem_fixtures import (
     cost_blocks_from_qr,
     make_spacecraft_params,
     tile_spacecraft_inertia,
 )
-from tests.helpers.solver_fixtures import turbompc_solver_params
+from tests.helpers.solver_fixtures import build_gauss_newton_qp, turbompc_solver_params
 from turbompc.dynamics.spacecraft_dynamics import SpacecraftDynamics
 from turbompc.problems.optimal_control_problem import OptimalControlProblem
 from turbompc.solvers.admm.admm import (
+    ADMMResiduals,
     ADMMSolver,
     ADMMState,
     _compute_dynamics_dual_terms,
     _compute_residuals,
     _dynamics_residual,
+    _update_rho,
     compute_gamma,
     compute_S_Phiinv,
 )
@@ -30,11 +34,10 @@ from turbompc.solvers.linear_systems_solvers.backends import (
 from turbompc.solvers.linear_systems_solvers.schur_solver import make_schur_solver
 from turbompc.solvers.qp_data import (
     QPCostBlocks,
-    QPData,
     QPEqualityBlocks,
     qpdata_from_ocp_blocks,
 )
-from turbompc.solvers.qp_utils import ZShape, pack_x, pack_z, unpack_z
+from turbompc.solvers.qp_utils import ZShape, pack_x, pack_z, unpack_x, unpack_z
 from turbompc.solvers.sqp_osqp import SQPOSQPSolver
 from turbompc.solvers.turbompc_solver import (
     BackwardBackend,
@@ -56,6 +59,27 @@ def _build_dense_C(eq, nx: int, nu: int) -> jnp.ndarray:
         C = C.at[row : row + nx, col_xk : col_xk + n].set(eq.A_minus[k])
         C = C.at[row : row + nx, col_xkp1 : col_xkp1 + n].set(eq.A_plus[k])
     return C
+
+
+def test_rho_update_max_factor_is_shared_and_infinity_disables_cap():
+    residuals = ADMMResiduals(
+        primal_residual=jnp.asarray(10_000.0),
+        dual_residual=jnp.asarray(1.0),
+        primal_residual_normalized=jnp.asarray(10_000.0),
+        dual_residual_normalized=jnp.asarray(1.0),
+        primal_residual_norm_term=jnp.asarray(1.0),
+        dual_residual_norm_term=jnp.asarray(1.0),
+    )
+
+    capped = _update_rho(
+        jnp.asarray(0.2), residuals, 1.0e-6, 1.0e6, rho_update_max_factor=3.0
+    )
+    uncapped = _update_rho(
+        jnp.asarray(0.2), residuals, 1.0e-6, 1.0e6, rho_update_max_factor=jnp.inf
+    )
+
+    np.testing.assert_allclose(capped, 0.6)
+    np.testing.assert_allclose(uncapped, 20.0)
 
 
 def _make_jax_turbompc_solver(program, params=None):
@@ -276,6 +300,7 @@ def test_residuals_match_explicit_dense(N):
         ineq_blocks=ineq_blocks,
         ineq_l=ineq_l,
         ineq_u=ineq_u,
+        slack_penalization_weight=jnp.asarray(0.0, dtype=D.dtype),
     )
 
     states = jnp.array(rng.standard_normal((N + 1, nx)))
@@ -344,23 +369,18 @@ def test_residuals_match_explicit_dense(N):
     )
 
     gamma = 2.0
+    qp = replace(
+        qp,
+        ineq=replace(
+            qp.ineq, slack_penalization_weight=jnp.asarray(gamma, dtype=qp.cost.q.dtype)
+        ),
+    )
     xi_g = jnp.ones_like(z_g) * 0.3
     dual_residual_slack = max(
         dual_residual, float(jnp.max(jnp.abs(gamma * xi_g + y_g)))
     )
-    qp_slack = QPData(
-        cost=qp.cost,
-        eq=qp.eq,
-        ineq=qp.ineq.__class__(
-            G=qp.ineq.G,
-            l=qp.ineq.l,
-            u=qp.ineq.u,
-            slack_penalization_weight=jnp.array(gamma, dtype=qp.ineq.l.dtype),
-            use_slack_variables=True,
-        ),
-    )
     residuals = _compute_residuals(
-        qp_slack,
+        qp,
         ADMMState(
             x_blocks=pack_x(states, controls),
             y_g=y_g,
@@ -370,6 +390,7 @@ def test_residuals_match_explicit_dense(N):
             xi_g=xi_g,
             rho_bar=0.1,
         ),
+        use_slack_variables=True,
     )
     np.testing.assert_allclose(
         float(residuals.dual_residual), dual_residual_slack, rtol=1e-6, atol=1e-6
@@ -392,7 +413,7 @@ def test_residuals_match_dense_spacecraft_qp():
     states, controls = problem.initial_guess(params)
     states = jnp.array(rng.standard_normal(states.shape)) * 0.1
     controls = jnp.array(rng.standard_normal(controls.shape)) * 0.1
-    qp = solver._build_qp_data(states, controls, params)
+    qp = build_gauss_newton_qp(solver, states, controls, params)
 
     N = params["horizon"]
     nx = problem.num_state_variables
@@ -505,7 +526,7 @@ def test_qp_assembly_matches_osqp_spacecraft_rescaling_implicit(implicit, rescal
     states = states + jnp.array(rng.standard_normal(states.shape)) * 0.1
     controls = controls + jnp.array(rng.standard_normal(controls.shape)) * 0.1
 
-    qp = solver_admm._build_qp_data(states, controls, params)
+    qp = build_gauss_newton_qp(solver_admm, states, controls, params)
     P_admm = _build_dense_P_from_cost_blocks(qp.cost)
     q_admm = qp.cost.q.reshape(-1)
     C_admm = _build_dense_C(
@@ -621,7 +642,7 @@ def test_kkt_residuals_admm_vs_osqp_spacecraft(rescale, final_weight, implicit):
     z_osqp = jnp.array(result.x, dtype=P.dtype)
     y_osqp = jnp.array(result.y, dtype=P.dtype)
 
-    qp = solver_admm._build_qp_data(states0, controls0, params)
+    qp = build_gauss_newton_qp(solver_admm, states0, controls0, params)
     admm_params = turbompc_solver_params()
     admm_cfg = admm_params["admm"]
     schur_solver = make_schur_solver(
@@ -654,10 +675,12 @@ def test_kkt_residuals_admm_vs_osqp_spacecraft(rescale, final_weight, implicit):
         ),
         admm_backend=AdmmBackend.JAX_LOOP,
     )
-    (states_admm, controls_admm), admm_stats, admm_state = admm_solver.solve(
+    admm_result = admm_solver.solve(
         qp_data=qp,
         rho_bar=admm_cfg["rho"],
     )
+    admm_state = admm_result.state
+    states_admm, controls_admm = unpack_x(admm_state.x_blocks, zshape)
     z_admm = pack_z(states_admm, controls_admm)
     y_admm = jnp.concatenate(
         [
@@ -720,6 +743,7 @@ def test_admm_linear_system_matches_dense(N):
         ineq_blocks=ineq_blocks,
         ineq_l=jnp.zeros((N + 1, 0)),
         ineq_u=jnp.zeros((N + 1, 0)),
+        slack_penalization_weight=jnp.asarray(0.0),
     )
     schur = compute_S_Phiinv(
         qp_data=qp_data,
@@ -755,6 +779,7 @@ def test_admm_linear_system_matches_dense(N):
         ineq_blocks=ineq_blocks,
         ineq_l=jnp.zeros((N + 1, 0)),
         ineq_u=jnp.zeros((N + 1, 0)),
+        slack_penalization_weight=jnp.asarray(0.0),
     )
     gammas = compute_gamma(
         qp_data=qp_data,

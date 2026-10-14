@@ -1,6 +1,8 @@
 #include "admm_fused.cuh"
 #include "admm_math.cuh"
 #include "admm_reductions.cuh"
+#include "admm_infeasibility.cuh"
+#include "admm_status.cuh"
 #include <cmath>
 #include <cfloat>
 #include <cstdio>  // for device printf (used by ADMM_PROFILE)
@@ -160,7 +162,7 @@ __device__ void pcgSolveDevice(
     // x_blocks now contains the PCG solution
 }
 
-// applyConstraintsDevice, overRelaxDevice, slackUpdateDevice, dualUpdateDevice → admm_math.cuh
+// applyConstraintsDevice, overRelaxDevice, projectionUpdateDevice, dualUpdateDevice → admm_math.cuh
 
 // ============================================================
 // Device function: compute residuals for convergence check
@@ -201,11 +203,11 @@ __device__ void computeResidualsDevice(
     // We'll compute these in scratch and then do inf-norm reductions.
 
     // Step 1: Compute Cx0 - c0 into scratch[0..n0-1]
-    if (tid < n0) {
+    for (int row = tid; row < n0; row += blockDim.x) {
         T sum = T(0);
         for (int k = 0; k < n; ++k)
-            sum += A0_g[tid * n + k] * x_blocks[k];
-        scratch[tid] = sum - c0_g[tid];
+            sum += A0_g[row * n + k] * x_blocks[k];
+        scratch[row] = sum - c0_g[row];
     }
     __syncthreads();
 
@@ -215,9 +217,9 @@ __device__ void computeResidualsDevice(
 
     // Step 2: Compute Cx_dyn - c_dyn into scratch[0..N*nx-1]
     int total_Nnx = N * nx;
-    if (tid < total_Nnx) {
-        int t = tid / nx;
-        int j = tid % nx;
+    for (int row = tid; row < total_Nnx; row += blockDim.x) {
+        int t = row / nx;
+        int j = row % nx;
         T sum = T(0);
         const T* Am_row = Aminus_g + t * nx * n + j * n;
         const T* Ap_row = Aplus_g  + t * nx * n + j * n;
@@ -225,7 +227,7 @@ __device__ void computeResidualsDevice(
         const T* x_tp = x_blocks + (t + 1) * n;
         for (int k = 0; k < n; ++k)
             sum += Am_row[k] * x_t[k] + Ap_row[k] * x_tp[k];
-        scratch[tid] = sum - cdyn_g[tid];
+        scratch[row] = sum - cdyn_g[row];
     }
     __syncthreads();
 
@@ -334,35 +336,35 @@ __device__ void computeResidualsDevice(
     // ---- Norm terms for normalized residuals (adaptive rho) ----
     // primal_norm_term = max(||Cx||_inf, ||c||_inf, ||Gx||_inf, ||z_g||_inf)
     // dual_norm_term   = max(||Px||_inf, ||q||_inf, ||C^T y_f + G^T y_g||_inf)
-    // These are computed by reusing scratch; cost is negligible (runs every check_every iters).
+    // These are computed by reusing scratch on termination-check iterations.
 
     T primal_norm_term = T(0);
     T dual_norm_term = T(0);
 
     // --- Primal norm terms ---
     // ||Cx0||_inf: A0 @ x[0]
-    if (tid < nx) {
+    for (int row = tid; row < n0; row += blockDim.x) {
         T sum = T(0);
         for (int k = 0; k < n; ++k)
-            sum += A0_g[tid * n + k] * x_blocks[k];
-        scratch[tid] = sum;
+            sum += A0_g[row * n + k] * x_blocks[k];
+        scratch[row] = sum;
     }
     __syncthreads();
     {
-        T norm_cx0 = blockInfNormShared(scratch, warp_buf, nx);
+        T norm_cx0 = blockInfNormShared(scratch, warp_buf, n0);
         if (tid == 0) primal_norm_term = norm_cx0;
     }
 
     // ||Cx_dyn||_inf: Am[t] @ x[t] + Ap[t] @ x[t+1]
-    if (tid < total_Nnx) {
-        int t = tid / nx;
-        int j = tid % nx;
+    for (int row = tid; row < total_Nnx; row += blockDim.x) {
+        int t = row / nx;
+        int j = row % nx;
         T sum = T(0);
         const T* Am_row = Aminus_g + t * nx * n + j * n;
         const T* Ap_row = Aplus_g  + t * nx * n + j * n;
         for (int k = 0; k < n; ++k)
             sum += Am_row[k] * x_blocks[t * n + k] + Ap_row[k] * x_blocks[(t + 1) * n + k];
-        scratch[tid] = sum;
+        scratch[row] = sum;
     }
     __syncthreads();
     {
@@ -371,15 +373,15 @@ __device__ void computeResidualsDevice(
     }
 
     // ||c||_inf: max(||c0||, ||c_dyn||)
-    if (tid < nx)
-        scratch[tid] = c0_g[tid];
+    for (int row = tid; row < n0; row += blockDim.x)
+        scratch[row] = c0_g[row];
     __syncthreads();
     {
-        T norm_c0 = blockInfNormShared(scratch, warp_buf, nx);
+        T norm_c0 = blockInfNormShared(scratch, warp_buf, n0);
         if (tid == 0) { if (norm_c0 > primal_norm_term) primal_norm_term = norm_c0; }
     }
-    if (tid < total_Nnx)
-        scratch[tid] = cdyn_g[tid];
+    for (int row = tid; row < total_Nnx; row += blockDim.x)
+        scratch[row] = cdyn_g[row];
     __syncthreads();
     {
         T norm_cdyn = blockInfNormShared(scratch, warp_buf, total_Nnx);
@@ -453,7 +455,7 @@ __device__ void computeResidualsDevice(
         int j = idx % n;
         T ct_yf = T(0);
         if (t == 0) {
-            for (int k = 0; k < nx; ++k)
+            for (int k = 0; k < n0; ++k)
                 ct_yf += A0_g[k * n + j] * y_f_0[k];
             if (N > 0)
                 for (int k = 0; k < nx; ++k)
@@ -500,10 +502,9 @@ __device__ void computeResidualsDevice(
 // ============================================================
 // Main fused ADMM kernel
 // ============================================================
-template<typename T>
+template<typename T, ConstraintHandling Handling>
 __global__ void __launch_bounds__(768) admmFusedKernel(
     // Outputs
-    T*        __restrict__ x_out,
     uint32_t* __restrict__ iters_out,
     T*        __restrict__ x_blocks_out,
     T*        __restrict__ z_g_out,
@@ -513,6 +514,9 @@ __global__ void __launch_bounds__(768) admmFusedKernel(
     T*        __restrict__ xi_g_out,
     T*        __restrict__ rho_bar_out,
     T*        __restrict__ kernel_ns_out,
+    uint32_t* __restrict__ status_out,
+    T*        __restrict__ residuals_out,
+    T*        __restrict__ certificate_work_global,
     // Workspace (writable global memory for adaptive rho)
     T*        __restrict__ S_work_global,       // [Nb, T, n, 3n]
     T*        __restrict__ Phiinv_work_global,  // [Nb, T, n, 3n]
@@ -542,11 +546,14 @@ __global__ void __launch_bounds__(768) admmFusedKernel(
     // Dimensions
     int T_blocks, int n, int nx, int n0, int m, int Nb,
     // Config
-    int max_iter, int pcg_max_iter, int check_every,
-    T eps_abs, T eps_rel, T sigma, T rho_f_factor, T alpha_relax, T pcg_eps,
-    bool use_slack,
+    int max_iter, int pcg_max_iter, int check_termination_every,
+    int check_infeasibility_every,
+    T eps_abs, T eps_rel, T eps_prim_inf, T eps_dual_inf,
+    T sigma, T rho_f_factor, T alpha_relax, T pcg_eps,
+    bool use_slack, T log_barrier_kappa,
     // Adaptive rho config
-    int adapt_rho_every, T adaptive_rho_tolerance, T rho_min, T rho_max)
+    int adapt_rho_every, T adaptive_rho_tolerance,
+    T rho_update_max_factor, T rho_min, T rho_max)
 {
     extern __shared__ char smem_raw[];
     T* smem = reinterpret_cast<T*>(smem_raw);
@@ -563,6 +570,7 @@ __global__ void __launch_bounds__(768) admmFusedKernel(
     const int total_tn = T_blocks * n;
     const int total_Tm = T_blocks * m;
     const int total_Nnx = N * nx;
+    const int certificate_stride = 7 + total_tn + 2 * total_Tm + n0 + total_Nnx;
 
     // ---- Compute batch offsets for global memory ----
     const int S_stride       = T_blocks * n * 3 * n;
@@ -602,6 +610,12 @@ __global__ void __launch_bounds__(768) admmFusedKernel(
     const T* yf0_b     = y_f_0_init_global  + bid * c0_stride;
     const T* yfdyn_b   = y_f_dyn_init_global + bid * cdyn_stride;
     const T* xi_g0_b   = xi_g0_global       + bid * l_stride;
+    T* certificate = certificate_work_global + bid * certificate_stride;
+    T* previous_x = certificate + 7;
+    T* previous_yg = previous_x + total_tn;
+    T* previous_yf0 = previous_yg + total_Tm;
+    T* previous_yfdyn = previous_yf0 + n0;
+    T* previous_xi = previous_yfdyn + total_Nnx;
 
     // ---- Shared memory layout ----
     // We lay out arrays sequentially:
@@ -613,8 +627,8 @@ __global__ void __launch_bounds__(768) admmFusedKernel(
     //   pcg_z:       [T*n]
     //   pcg_p:       [T*n]
     //   pcg_Sp:      [T*n]
-    //   scalars:     [16]
-    //   warp_buf:    [32]
+    //   scalars:     [17]
+    //   warp_buf:    [7*32]
     //   scratch:     max(T*m, T*n, N*nx) for constraint eval / residuals / z_g_old
     //
     // NOTE: z_g, y_g, xi_g are stored in global memory (using the output buffers
@@ -632,8 +646,8 @@ __global__ void __launch_bounds__(768) admmFusedKernel(
     T* sh_pcg_p    = sh_pcg_z    + total_tn;
     T* sh_pcg_Sp   = sh_pcg_p    + total_tn;
     T* sh_scalars  = sh_pcg_Sp   + total_tn;
-    T* sh_warp_buf = sh_scalars  + 16;
-    T* sh_scratch  = sh_warp_buf + 32;
+    T* sh_warp_buf = sh_scalars  + 17;
+    T* sh_scratch  = sh_warp_buf + 7 * 32;
 
     // z_g, y_g, xi_g use the output buffers as in-place workspace (global memory).
     // This avoids 3*T*m elements in shared memory.
@@ -662,7 +676,7 @@ __global__ void __launch_bounds__(768) admmFusedKernel(
         rho_bar = rho_bar_init_global[bid];
         slack_weight = slack_weight_global[bid];
         sh_scalars[8] = rho_bar;   // store rho_bar in scalars[8]
-        sh_scalars[9] = T(0);      // convergence flag
+        sh_scalars[9] = T(0);      // termination flag
     }
     __syncthreads();
 
@@ -676,6 +690,7 @@ __global__ void __launch_bounds__(768) admmFusedKernel(
         sh_scalars[10] = T(1);     // primal_norm_term
         sh_scalars[11] = T(1);     // dual_norm_term
         sh_scalars[15] = T(0);    // rho update flag
+        sh_scalars[16] = T(ADMM_STATUS_NOT_RUN);
     }
     __syncthreads();
 
@@ -701,6 +716,32 @@ __global__ void __launch_bounds__(768) admmFusedKernel(
     for (int it = 0; it < max_iter; ++it) {
         rho_bar = sh_scalars[8];
         T rho_f = rho_bar * rho_f_factor;
+        bool termination_check_fires =
+            (check_termination_every > 0
+             && (it % check_termination_every == 0))
+            || it + 1 == max_iter;
+        // Hard-QP infeasibility certificates only apply to projection; a
+        // barrier solve reports SOLVED, MAX_ITER, or NONFINITE.
+        bool infeasibility_check_fires =
+            Handling == ConstraintHandling::Projection
+            && ((check_infeasibility_every > 0
+                 && (it % check_infeasibility_every == 0))
+                || it + 1 == max_iter);
+        bool status_check_fires =
+            termination_check_fires || infeasibility_check_fires;
+        if (infeasibility_check_fires) {
+            for (int i = tid; i < total_tn; i += blockDim.x)
+                previous_x[i] = sh_x_blocks[i];
+            for (int i = tid; i < total_Tm; i += blockDim.x) {
+                previous_yg[i] = sh_y_g[i];
+                previous_xi[i] = sh_xi_g[i];
+            }
+            for (int i = tid; i < n0; i += blockDim.x)
+                previous_yf0[i] = sh_y_f_0[i];
+            for (int i = tid; i < total_Nnx; i += blockDim.x)
+                previous_yfdyn[i] = sh_y_f_dyn[i];
+            __syncthreads();
+        }
 
 #ifdef ADMM_PROFILE
         unsigned long long t_iter_start = 0, t0 = 0, t1 = 0, t2 = 0, t3 = 0;
@@ -774,13 +815,22 @@ __global__ void __launch_bounds__(768) admmFusedKernel(
         if (do_profile && tid == 0) t5 = clock64();
 #endif
 
-        // Slack update: z_g = clamp(z_tilde, l, u)
-        slackUpdateDevice(
-            sh_z_g, scratch_Gx, sh_y_g,
-            l_b, u_b,
-            alpha_relax, rho_bar,
-            T_blocks, m,
-            slack_weight, use_slack, sh_xi_g);
+        // 2e. Inequality proximal
+        if constexpr (Handling == ConstraintHandling::LogBarrier) {
+            logBarrierUpdateDevice(
+                sh_z_g, scratch_Gx, sh_y_g,
+                l_b, u_b,
+                alpha_relax, rho_bar,
+                T_blocks, m,
+                log_barrier_kappa, slack_weight, use_slack, sh_xi_g);
+        } else {
+            projectionUpdateDevice(
+                sh_z_g, scratch_Gx, sh_y_g,
+                l_b, u_b,
+                alpha_relax, rho_bar,
+                T_blocks, m,
+                slack_weight, use_slack, sh_xi_g);
+        }
 
 #ifdef ADMM_PROFILE
         if (do_profile && tid == 0) t6 = clock64();
@@ -799,8 +849,8 @@ __global__ void __launch_bounds__(768) admmFusedKernel(
         if (do_profile && tid == 0) t7 = clock64();
 #endif
 
-        // 2g. Convergence check every check_every iterations
-        if (check_every > 0 && (it % check_every == 0)) {
+        // 2g. Scheduled status checks
+        if (status_check_fires) {
             // Use sh_scratch for residual computation work area
             computeResidualsDevice(
                 sh_scalars,
@@ -812,25 +862,69 @@ __global__ void __launch_bounds__(768) admmFusedKernel(
                 T_blocks, n, nx, n0, m,
                 sh_xi_g, slack_weight, use_slack);
 
-            // Check convergence using normalized residuals
-            // primal_res in scalars[6], dual_res in scalars[7]
-            // norm terms in scalars[10], scalars[11]
+            if (infeasibility_check_fires) {
+                ComputeADMMInfeasibilityMetrics(
+                    certificate,
+                    sh_x_blocks, sh_y_g, sh_y_f_0, sh_y_f_dyn, sh_xi_g,
+                    previous_x, previous_yg, previous_yf0, previous_yfdyn,
+                    previous_xi,
+                    D_b, E_b, q_b, A0_b, Am_b, Ap_b, G_b,
+                    l_b, u_b, c0_b, cdyn_b,
+                    slack_weight, use_slack,
+                    T_blocks, n, nx, n0, m, sh_warp_buf);
+            }
+
+            T nonfinite_local = T(0);
+            for (int i = tid; i < total_tn; i += blockDim.x)
+                if (!isfinite(sh_x_blocks[i])) nonfinite_local = T(1);
+            for (int i = tid; i < total_Tm; i += blockDim.x)
+                if (!isfinite(sh_z_g[i]) || !isfinite(sh_y_g[i])
+                    || !isfinite(sh_xi_g[i])) nonfinite_local = T(1);
+            for (int i = tid; i < n0; i += blockDim.x)
+                if (!isfinite(sh_y_f_0[i])) nonfinite_local = T(1);
+            for (int i = tid; i < total_Nnx; i += blockDim.x)
+                if (!isfinite(sh_y_f_dyn[i])) nonfinite_local = T(1);
+            T any_nonfinite = ADMMBlockMax(nonfinite_local, sh_warp_buf);
+
             if (tid == 0) {
                 T p_res = sh_scalars[6];
                 T d_res = sh_scalars[7];
-                T p_margin = eps_abs + eps_rel * sh_scalars[10];
-                T d_margin = eps_abs + eps_rel * sh_scalars[11];
-                bool converged = (p_res < p_margin) && (d_res < d_margin);
+                T p_limit = eps_abs + eps_rel * sh_scalars[10];
+                T d_limit = eps_abs + eps_rel * sh_scalars[11];
+                bool finite = any_nonfinite == T(0) && isfinite(p_res)
+                    && isfinite(d_res) && isfinite(sh_scalars[10])
+                    && isfinite(sh_scalars[11]) && isfinite(rho_bar);
+                T direction_floor = T(10) * (
+                    sizeof(T) == sizeof(float) ? T(FLT_EPSILON) : T(DBL_EPSILON));
+                bool primal_infeasible = infeasibility_check_fires
+                    && certificate[0] > direction_floor
+                    && certificate[1] <= eps_prim_inf * certificate[0]
+                    && certificate[2] <= -eps_prim_inf * certificate[0];
+                bool dual_infeasible = infeasibility_check_fires
+                    && certificate[3] > direction_floor
+                    && certificate[4] <= eps_dual_inf * certificate[3]
+                    && certificate[5] <= -eps_dual_inf * certificate[3]
+                    && certificate[6] <= eps_dual_inf * certificate[3];
+                bool converged = termination_check_fires && finite
+                    && p_res <= p_limit && d_res <= d_limit;
+                int32_t status = SelectADMMStatus(
+                    !finite, converged, primal_infeasible, dual_infeasible,
+                    it + 1 == max_iter);
+                sh_scalars[16] = T(status);
+                residuals_out[bid * 4] = p_res;
+                residuals_out[bid * 4 + 1] = d_res;
+                residuals_out[bid * 4 + 2] = p_limit;
+                residuals_out[bid * 4 + 3] = d_limit;
 #ifdef ADMM_TRACE
                 if (bid == 0) {
-                    printf("ADMM_TRACE: iter=%d p_res=%.6e d_res=%.6e p_norm=%.6e d_norm=%.6e p_margin=%.6e d_margin=%.6e conv=%d\n",
+                    printf("ADMM_TRACE: iter=%d p_res=%.6e d_res=%.6e p_norm=%.6e d_norm=%.6e p_limit=%.6e d_limit=%.6e conv=%d\n",
                            it, (double)p_res, (double)d_res,
                            (double)sh_scalars[10], (double)sh_scalars[11],
-                           (double)p_margin, (double)d_margin, (int)converged);
+                           (double)p_limit, (double)d_limit, (int)converged);
                 }
 #endif
-                if (converged) {
-                    sh_scalars[9] = T(1);  // convergence flag
+                if (status != ADMM_STATUS_NOT_RUN) {
+                    sh_scalars[9] = T(1);  // termination flag
                 }
             }
             __syncthreads();
@@ -854,14 +948,19 @@ __global__ void __launch_bounds__(768) admmFusedKernel(
                 break;
             }
 
-            // ---- Adaptive rho daemon ----
+            // ---- Adaptive rho update ----
             // Match JAX: it % adapt_rho_every == 0 && it >= 2 (0-based)
-            if (adapt_rho_every > 0 && it >= 2 && (it % adapt_rho_every == 0)) {
+            if (termination_check_fires && adapt_rho_every > 0 && it >= 2
+                && (it % adapt_rho_every == 0)) {
                 // Thread 0 decides if rho should change
                 if (tid == 0) {
                     T p_norm = sh_scalars[13]; // primal_residual_normalized
                     T d_norm = sh_scalars[14]; // dual_residual_normalized
                     T ratio = sqrt(p_norm / (d_norm + T(1e-30)));
+                    if (ratio < T(1) / rho_update_max_factor)
+                        ratio = T(1) / rho_update_max_factor;
+                    if (ratio > rho_update_max_factor)
+                        ratio = rho_update_max_factor;
                     T rho_candidate = sh_scalars[8] * ratio;
                     if (rho_candidate < rho_min) rho_candidate = rho_min;
                     if (rho_candidate > rho_max) rho_candidate = rho_max;
@@ -913,8 +1012,8 @@ __global__ void __launch_bounds__(768) admmFusedKernel(
 #ifdef ADMM_PROFILE
         // Print timing for this iteration (use t7 as end if no residual check)
         if (do_profile && tid == 0) {
-            unsigned long long t_end_iter = (check_every > 0 && ((it + 1) % check_every == 0)) ? t8 : t7;
-            unsigned long long resid = (check_every > 0 && ((it + 1) % check_every == 0)) ? (t8 - t7) : 0;
+            unsigned long long t_end_iter = status_check_fires ? t8 : t7;
+            unsigned long long resid = status_check_fires ? (t8 - t7) : 0;
             unsigned long long total = t_end_iter - t_iter_start;
             int pcg_iters = (int)sh_scalars[12] + 1;
             printf("ADMM_PROFILE: %d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%d\n",
@@ -927,13 +1026,10 @@ __global__ void __launch_bounds__(768) admmFusedKernel(
     // ---- 3. Store results to global memory ----
     rho_bar = sh_scalars[8];
 
-    // x_out and x_blocks_out
-    T* xo = x_out + bid * q_stride;
+    // x_blocks_out
     T* xbo = x_blocks_out + bid * q_stride;
-    for (int i = tid; i < total_tn; i += blockDim.x) {
-        xo[i] = sh_x_blocks[i];
+    for (int i = tid; i < total_tn; i += blockDim.x)
         xbo[i] = sh_x_blocks[i];
-    }
 
     // z_g_out and y_g_out: already in-place (sh_z_g = z_g_out + bid*l_stride, etc.)
 
@@ -953,6 +1049,7 @@ __global__ void __launch_bounds__(768) admmFusedKernel(
     if (tid == 0) {
         rho_bar_out[bid] = rho_bar;
         iters_out[bid] = final_iter;
+        status_out[bid] = static_cast<uint32_t>(sh_scalars[16]);
 
         // Record kernel time in nanoseconds
         // clock64() returns SM clock cycles; convert to ns using 1e9/clockRate
@@ -971,10 +1068,11 @@ __global__ void __launch_bounds__(768) admmFusedKernel(
 template<typename T>
 static cudaError_t launchADMMFused(
     cudaStream_t stream,
-    T* x_out, uint32_t* iters_out,
+    uint32_t* iters_out,
     T* x_blocks_out, T* z_g_out, T* y_g_out,
     T* y_f_0_out, T* y_f_dyn_out, T* xi_g_out, T* rho_bar_out,
-    T* kernel_ns_out,
+    T* kernel_ns_out, uint32_t* status_out, T* residuals_out,
+    T* certificate_work,
     T* S_work, T* Phiinv_work,
     const T* S, const T* Phiinv, const T* D, const T* E, const T* q,
     const T* A0, const T* A_minus, const T* A_plus, const T* G,
@@ -1008,7 +1106,7 @@ static cudaError_t launchADMMFused(
     //   x_blocks[T*n] + y_f_0[n0] + y_f_dyn[N*nx]
     //   + gamma[T*n]
     //   + pcg_r[T*n] + pcg_z[T*n] + pcg_p[T*n] + pcg_Sp[T*n]
-    //   + scalars[16] + warp_buf[32]
+    //   + scalars[17] + warp_buf[7*32]
     //   + scratch: x_old (T*n) + Cx0 (n0) + Cx_dyn (N*nx)
     // NOTE: z_g, y_g, xi_g are in global memory (output buffers used as workspace).
     int scratch_size = total_tn + n0 + total_Nnx;
@@ -1022,17 +1120,24 @@ static cudaError_t launchADMMFused(
         + total_tn        // pcg_z
         + total_tn        // pcg_p
         + total_tn        // pcg_Sp
-        + 16              // scalars
-        + 32              // warp_buf
+        + 17              // scalars
+        + 7 * 32          // warp_buf: seven certificate metrics per warp
         + scratch_size;   // scratch
 
     size_t smem_bytes = smem_elems * sizeof(T);
+
+    // Both instantiations share one signature, so the selection is a pointer.
+    // cudaFuncSetAttribute below must target the instantiation we launch.
+    auto admmFused =
+        cfg.constraint_handling == ConstraintHandling::LogBarrier
+            ? admmFusedKernel<T, ConstraintHandling::LogBarrier>
+            : admmFusedKernel<T, ConstraintHandling::Projection>;
 
     // Opt-in to extended shared memory if needed (>48 KB).
     // This is required for large horizons (H>=40 with n=12, F64).
     if (smem_bytes > 48 * 1024) {
         cudaError_t attr_err = cudaFuncSetAttribute(
-            admmFusedKernel<T>,
+            admmFused,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             (int)smem_bytes);
         if (attr_err != cudaSuccess) {
@@ -1047,29 +1152,35 @@ static cudaError_t launchADMMFused(
     // Convert config to kernel-type values
     T eps_abs_k   = static_cast<T>(cfg.eps_abs);
     T eps_rel_k   = static_cast<T>(cfg.eps_rel);
+    T eps_prim_inf_k = static_cast<T>(cfg.eps_prim_inf);
+    T eps_dual_inf_k = static_cast<T>(cfg.eps_dual_inf);
     T sigma_k     = static_cast<T>(cfg.sigma);
     T rho_f_k     = static_cast<T>(cfg.rho_f_factor);
     T alpha_k     = static_cast<T>(cfg.alpha);
     T pcg_eps_k   = static_cast<T>(cfg.pcg_eps);
     bool use_sl   = cfg.use_slack;
     T rho_tol_k   = static_cast<T>(cfg.adaptive_rho_tolerance);
+    T rho_factor_k = static_cast<T>(cfg.rho_update_max_factor);
     T rho_min_k   = static_cast<T>(cfg.rho_min);
     T rho_max_k   = static_cast<T>(cfg.rho_max);
+    T log_barrier_kappa_k = static_cast<T>(cfg.log_barrier_kappa);
 
-    admmFusedKernel<T><<<Nb, threads, smem_bytes, stream>>>(
-        x_out, iters_out,
+    admmFused<<<Nb, threads, smem_bytes, stream>>>(
+        iters_out,
         x_blocks_out, z_g_out, y_g_out, y_f_0_out, y_f_dyn_out, xi_g_out, rho_bar_out,
-        kernel_ns_out,
+        kernel_ns_out, status_out, residuals_out, certificate_work,
         S_work, Phiinv_work,
         S, Phiinv, D, E, q,
         A0, A_minus, A_plus, G, l_bounds, u_bounds, c0, c_dyn,
         x0, z_g0, y_g0, y_f_0_init, y_f_dyn_init, xi_g0, rho_bar_init,
         slack_weight_init,
         T_blocks, n, nx, n0, m, Nb,
-        cfg.max_iter, cfg.pcg_max_iter, cfg.check_every,
-        eps_abs_k, eps_rel_k, sigma_k, rho_f_k, alpha_k, pcg_eps_k,
-        use_sl,
-        cfg.adapt_rho_every, rho_tol_k, rho_min_k, rho_max_k);
+        cfg.max_iter, cfg.pcg_max_iter, cfg.check_termination_every,
+        cfg.check_infeasibility_every,
+        eps_abs_k, eps_rel_k, eps_prim_inf_k, eps_dual_inf_k,
+        sigma_k, rho_f_k, alpha_k, pcg_eps_k,
+        use_sl, log_barrier_kappa_k,
+        cfg.adapt_rho_every, rho_tol_k, rho_factor_k, rho_min_k, rho_max_k);
     return cudaPeekAtLastError();
 }
 
@@ -1077,10 +1188,11 @@ static cudaError_t launchADMMFused(
 
 cudaError_t LaunchADMMFusedF32(
     cudaStream_t stream,
-    float* x_out, uint32_t* iters_out,
+    uint32_t* iters_out,
     float* x_blocks_out, float* z_g_out, float* y_g_out,
     float* y_f_0_out, float* y_f_dyn_out, float* xi_g_out, float* rho_bar_out,
-    float* kernel_ns_out,
+    float* kernel_ns_out, uint32_t* status_out, float* residuals_out,
+    float* certificate_work,
     float* S_work, float* Phiinv_work,
     const float* S, const float* Phiinv, const float* D, const float* E, const float* q,
     const float* A0, const float* A_minus, const float* A_plus, const float* G,
@@ -1092,9 +1204,9 @@ cudaError_t LaunchADMMFusedF32(
     ADMMConfig cfg)
 {
     return launchADMMFused<float>(stream,
-        x_out, iters_out,
+        iters_out,
         x_blocks_out, z_g_out, y_g_out, y_f_0_out, y_f_dyn_out, xi_g_out, rho_bar_out,
-        kernel_ns_out,
+        kernel_ns_out, status_out, residuals_out, certificate_work,
         S_work, Phiinv_work,
         S, Phiinv, D, E, q,
         A0, A_minus, A_plus, G, l_bounds, u_bounds, c0, c_dyn,
@@ -1105,10 +1217,11 @@ cudaError_t LaunchADMMFusedF32(
 
 cudaError_t LaunchADMMFusedF64(
     cudaStream_t stream,
-    double* x_out, uint32_t* iters_out,
+    uint32_t* iters_out,
     double* x_blocks_out, double* z_g_out, double* y_g_out,
     double* y_f_0_out, double* y_f_dyn_out, double* xi_g_out, double* rho_bar_out,
-    double* kernel_ns_out,
+    double* kernel_ns_out, uint32_t* status_out, double* residuals_out,
+    double* certificate_work,
     double* S_work, double* Phiinv_work,
     const double* S, const double* Phiinv, const double* D, const double* E, const double* q,
     const double* A0, const double* A_minus, const double* A_plus, const double* G,
@@ -1120,9 +1233,9 @@ cudaError_t LaunchADMMFusedF64(
     ADMMConfig cfg)
 {
     return launchADMMFused<double>(stream,
-        x_out, iters_out,
+        iters_out,
         x_blocks_out, z_g_out, y_g_out, y_f_0_out, y_f_dyn_out, xi_g_out, rho_bar_out,
-        kernel_ns_out,
+        kernel_ns_out, status_out, residuals_out, certificate_work,
         S_work, Phiinv_work,
         S, Phiinv, D, E, q,
         A0, A_minus, A_plus, G, l_bounds, u_bounds, c0, c_dyn,

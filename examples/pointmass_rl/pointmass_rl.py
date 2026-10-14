@@ -35,6 +35,7 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
+
 from examples.pointmass_rl.optimizer import adam_init, adam_step
 from examples.pointmass_rl.policy import init_policy, policy_apply
 from tests.helpers.solver_fixtures import turbompc_solver_params
@@ -254,7 +255,9 @@ def main() -> None:
     t0 = time.time()
     rmse0 = rmse_2cyc(theta)
     t1 = time.time()
-    print(f"   0       —          {rmse0:.4e}            —      {t1-t0:.1f}s  (init eval)")
+    print(
+        f"   0       —          {rmse0:.4e}            —      {t1-t0:.1f}s  (init eval)"
+    )
 
     with open(LOG_PATH, "w") as f:
         f.write("step,train_loss,eval_rmse,grad_norm,step_time\n")
@@ -277,8 +280,8 @@ def main() -> None:
             last_rmse = rmse_t
             print(
                 (
-                    f"  {step+1:>3}   {float(L):.4e}     {rmse_t:.4e}      {gnorm:.3e}    "
-                    f" {step_time:.3f}s"
+                    f"  {step+1:>3}   {float(L):.4e}     {rmse_t:.4e}      {gnorm:.3e} "
+                    f"    {step_time:.3f}s"
                 ),
                 flush=True,
             )

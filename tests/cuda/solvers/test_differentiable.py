@@ -5,16 +5,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax import jit
+
 from tests.helpers.backend_utils import backend_available
+from tests.helpers.constraint_handling_fixtures import HANDLINGS, with_handling
 from tests.helpers.problem_fixtures import tile_spacecraft_inertia
 from tests.helpers.solver_fixtures import sqp_params, turbompc_solver_params
 from turbompc.dynamics.spacecraft_dynamics import SpacecraftDynamics
-from turbompc.problems.optimal_control_problem import (
-    OptimalControlProblem,
-    OptimalControlProblemSlack,
-)
+from turbompc.problems.optimal_control_problem import OptimalControlProblem
 from turbompc.solvers.linear_systems_solvers.backends import SchurSolverBackend
 from turbompc.solvers.sqp_diffmpc import SQPDiffMPCSolver
+from turbompc.solvers.status import SQPStatus
 from turbompc.solvers.turbompc_solver import (
     BackwardBackend,
     ForwardBackend,
@@ -93,19 +93,18 @@ def _run_turbompc_solver_diff_test(
     use_slack_variables,
     forward_backend: ForwardBackend,
     backward_backend: BackwardBackend,
-    test_jittable: bool = False,
 ):
     dynamics = SpacecraftDynamics()
-    if use_slack_variables:
-        problem = OptimalControlProblemSlack(dynamics=dynamics, params=problem_params)
-    else:
-        problem = OptimalControlProblem(dynamics=dynamics, params=problem_params)
+    problem = OptimalControlProblem(dynamics=dynamics, params=problem_params)
     solver = TurboMPCSolver(
         program=problem,
         params=solver_params,
         forward_backend=forward_backend,
         backward_backend=backward_backend,
     )
+    guess = solver.initial_guess(problem_params)
+    # Gradients of an unconverged solve are not the implicit-function gradients.
+    assert int(solver.solve(guess, problem_params).status) == int(SQPStatus.SOLVED)
 
     weights = {
         k: problem_params[k]
@@ -115,25 +114,21 @@ def _run_turbompc_solver_diff_test(
         ]
     }
     if use_slack_variables:
-        weights["slack_penalization_weight"] = problem_params[
-            "slack_penalization_weight"
-        ]
-
-    def objective(weights):
-        solution = solver.solve(
-            solver.initial_guess(problem_params),
-            problem_params=problem_params,
-            weights=weights,
+        weights["slack_penalization_weight"] = jnp.asarray(
+            problem_params["slack_penalization_weight"]
         )
+
+    # Jitted once and reused for every finite-difference evaluation; eager
+    # solves cost ~20x more. This also covers differentiating under jit.
+    @jit
+    def objective(weights):
+        solution = solver.solve(guess, problem_params=problem_params, weights=weights)
         total = jnp.linalg.norm(solution.states) + jnp.linalg.norm(solution.controls)
         if use_slack_variables:
             total = total + jnp.sum(solution.slack**2)
         return total
 
-    grad_obj_fn = jax.grad(objective)
-    if test_jittable:
-        grad_obj_fn = jit(grad_obj_fn)
-    grad = grad_obj_fn(weights)
+    grad = jit(jax.grad(objective))(weights)
     grad_fd = gradient_finite_diff(objective, weights=weights, eps=eps)
 
     for key in weights.keys():
@@ -149,9 +144,9 @@ def _run_turbompc_solver_diff_test(
     "forward_backend,backward_backend",
     [
         pytest.param(
-            ForwardBackend.ADMM_JAX_LOOP_PCG,
-            BackwardBackend.ADMM_JAX_LOOP_PCG,
-            id="admm_jax_loop_pcg",
+            ForwardBackend.ADMM_JAX_LOOP_JAX_DENSE,
+            BackwardBackend.ADMM_JAX_LOOP_JAX_DENSE,
+            id="admm_jax_loop_jax_dense",
         ),
         pytest.param(
             ForwardBackend.ADMM_JAX_LOOP_CUDSS_FFI,
@@ -164,24 +159,19 @@ def _run_turbompc_solver_diff_test(
         ),
     ],
 )
+@pytest.mark.parametrize(("constraint_handling", "log_barrier_kappa"), HANDLINGS)
 @pytest.mark.parametrize(
-    "with_box_constraints, use_slack_variables, horizon, tol, test_jittable",
-    [
-        (False, False, 10, 1e-12, False),
-        (True, False, 8, 1e-10, False),
-        (True, True, 6, 1e-10, False),
-        (False, False, 10, 1e-12, True),
-        (True, False, 8, 1e-10, True),
-    ],
+    "with_box_constraints, use_slack_variables, horizon",
+    [(False, False, 10), (True, False, 8), (True, True, 6)],
 )
 def test_turbompc_solver_solve_differentiable(
     forward_backend,
     backward_backend,
+    constraint_handling,
+    log_barrier_kappa,
     with_box_constraints,
     use_slack_variables,
     horizon,
-    tol,
-    test_jittable,
 ):
     """Test SQP-ADMM gradients with and without box constraints."""
     np.random.seed(0)
@@ -200,35 +190,25 @@ def test_turbompc_solver_solve_differentiable(
         (turbompc_horizon + 1, 3)
     )
     problem_params["weights_penalization_final_state"] = jnp.zeros(3)
+    problem_params["use_slack_variables"] = use_slack_variables
+    problem_params["slack_penalization_weight"] = 1.0 if use_slack_variables else 0.0
 
     if with_box_constraints:
         problem_params["state_min_bounds"] = jnp.array([-0.2, -0.2, -0.2])
         problem_params["state_max_bounds"] = jnp.array([0.2, 0.2, 0.2])
         problem_params["control_min_bounds"] = jnp.array([-0.3, -0.3, -0.3])
         problem_params["control_max_bounds"] = jnp.array([0.3, 0.3, 0.3])
-    if use_slack_variables:
-        problem_params["use_slack_variables"] = True
-        problem_params["slack_penalization_weight"] = jnp.array(1.0)
-
-    solver_params = turbompc_solver_params(tol=tol, sqp_iters=10, admm_max=500)
-    solver_params["linesearch"] = False
+    solver_params = with_handling(
+        turbompc_solver_params(tol=1e-10, sqp_iters=10, admm_max=500), log_barrier_kappa
+    )
+    solver_params["linesearch"]["method"] = "none"
     solver_params["warm_start_backward"] = True
 
-    eps = (
-        1e-8
-        if with_box_constraints
-        else (
-            1e-10
-            if forward_backend == ForwardBackend.ADMM_JAX_LOOP_CUDSS_FFI
-            else 1e-12
-        )
-    )
     _run_turbompc_solver_diff_test(
         problem_params,
         solver_params,
-        eps,
+        1e-5,
         use_slack_variables,
         forward_backend=forward_backend,
         backward_backend=backward_backend,
-        test_jittable=test_jittable,
     )

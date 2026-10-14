@@ -31,6 +31,7 @@ from typing import Any, Optional
 
 import jax.numpy as jnp
 import pytest
+
 from tests.helpers.backend_utils import backend_available
 from tests.helpers.problem_fixtures import (
     make_drone_params,
@@ -40,17 +41,16 @@ from tests.helpers.problem_fixtures import (
 from tests.helpers.solver_fixtures import turbompc_solver_params
 from turbompc.dynamics.spacecraft_dynamics import SpacecraftDynamics
 from turbompc.problems.obstacle_avoidance import OptimalControlProblemObstacle
-from turbompc.problems.optimal_control_problem import (
-    OptimalControlProblem,
-    OptimalControlProblemSlack,
-)
+from turbompc.problems.optimal_control_problem import OptimalControlProblem
+from turbompc.solvers.linesearch import LinesearchMethod
 from turbompc.solvers.turbompc_solver import (
     BackwardBackend,
     ForwardBackend,
+    HessianApproximation,
     TurboMPCSolver,
 )
 
-_VALID_OCP_VARIANTS = ("base", "obstacle", "slack", "obstacle_slack")
+_VALID_OCP_VARIANTS = ("base", "obstacle")
 _VALID_DYNAMICS = ("linear", "spacecraft", "drone")
 _VALID_DISCRETIZATION = ("euler", "midpoint", "rk4", "implicit")
 _VALID_BOUNDS_MODE = ("both", "control_only", "state_only", "none")
@@ -64,6 +64,7 @@ _DEFAULT_BACKWARD: dict[ForwardBackend, BackwardBackend] = {
     ForwardBackend.ADMM_JAX_LOOP_PCG_FFI: BackwardBackend.ADMM_JAX_LOOP_PCG_FFI,
     ForwardBackend.ADMM_JAX_LOOP_CUDSS_FFI: BackwardBackend.ADMM_JAX_LOOP_CUDSS_FFI,
     ForwardBackend.ADMM_JAX_LOOP_JAX_DENSE: BackwardBackend.ADMM_JAX_LOOP_JAX_DENSE,
+    ForwardBackend.ADMM_JAX_LOOP_EIGEN: BackwardBackend.ADMM_JAX_LOOP_EIGEN,
     ForwardBackend.ADMM_FUSED_PCG: BackwardBackend.DIRECT_CUDSS_FFI,
     ForwardBackend.ADMM_FUSED_CUDSS: BackwardBackend.DIRECT_CUDSS_FFI,
 }
@@ -72,7 +73,7 @@ _DEFAULT_BACKWARD: dict[ForwardBackend, BackwardBackend] = {
 @dataclass(frozen=True)
 class OCPSpec:
     # Problem structure
-    ocp_variant: str = "base"  # "base", "obstacle", "slack", "obstacle_slack"
+    ocp_variant: str = "base"  # "base", "obstacle"
     dynamics: str = "spacecraft"  # "linear", "spacecraft", "drone"
     # Time / integration
     horizon: int = 10
@@ -87,12 +88,12 @@ class OCPSpec:
     state_bound: float = 10.0
     control_bound: float = 10.0
     constrain_initial_control: bool = False
+    use_slack_variables: bool = False
+    slack_penalization_weight: float = 0.0
     # Rescaling
     rescale: bool = False
     rescaling_mode: str = "none"  # "none", "unit", "linspace"
-    # Slack
-    slack_weight: float = 10.0
-    # Obstacle (only valid for "obstacle" / "obstacle_slack")
+    # Obstacle (only valid for "obstacle")
     obstacle_centers: tuple = ()
     obstacle_radii: tuple = ()
     obstacle_dim: int = 2
@@ -144,7 +145,7 @@ def _validate_ocp_spec(spec: OCPSpec) -> None:
         raise ValueError(
             f"ocp_variant={spec.ocp_variant!r} requires dynamics='drone', "
             f"got dynamics={spec.dynamics!r}. "
-            "Hint: set dynamics='drone' or use ocp_variant='base'/'slack'."
+            "Hint: set dynamics='drone' or use ocp_variant='base'."
         )
     if "obstacle" in spec.ocp_variant and not spec.obstacle_centers:
         raise ValueError(
@@ -169,11 +170,12 @@ class SolverSpec:
     # Backends
     forward_backend: ForwardBackend = ForwardBackend.ADMM_JAX_LOOP_PCG
     backward_backend: Optional[BackwardBackend] = None  # auto-default via map
-    use_full_hessian: bool = False
+    forward_hessian: HessianApproximation = HessianApproximation.GAUSS_NEWTON
+    backward_hessian: HessianApproximation = HessianApproximation.GAUSS_NEWTON
     # SQP outer loop
     num_sqp_iter: int = 10
     tol_convergence: float = 1e-4
-    linesearch: bool = False
+    linesearch_method: LinesearchMethod = LinesearchMethod.NONE
     # ADMM inner loop
     admm_sigma: float = 1e-6
     admm_max_iter: int = 500
@@ -199,16 +201,18 @@ class SolverSpec:
         return self.backward_backend or _DEFAULT_BACKWARD[self.forward_backend]
 
     def pytest_id(self) -> str:
-        parts = [self.forward_backend.name]
+        parts = [
+            self.forward_backend.name,
+            f"fwh-{self.forward_hessian.name}",
+            f"bwh-{self.backward_hessian.name}",
+        ]
         if (
             self.backward_backend is not None
             and self.backward_backend != _DEFAULT_BACKWARD[self.forward_backend]
         ):
             parts.append(f"bw-{self.backward_backend.name}")
-        if self.use_full_hessian:
-            parts.append("fh")
-        if self.linesearch:
-            parts.append("ls")
+        if self.linesearch_method != LinesearchMethod.NONE:
+            parts.append(f"ls-{self.linesearch_method.name.lower()}")
         return "-".join(parts)
 
 
@@ -226,11 +230,24 @@ def _validate_solver_spec(spec: SolverSpec) -> None:
             "backward_backend must be BackwardBackend enum or None, got"
             f" {type(spec.backward_backend)}."
         )
-    if spec.use_full_hessian:
+    if not isinstance(spec.linesearch_method, LinesearchMethod):
+        raise ValueError(
+            "linesearch_method must be LinesearchMethod enum, got"
+            f" {type(spec.linesearch_method)}."
+        )
+    if not isinstance(spec.backward_hessian, HessianApproximation):
+        raise ValueError(
+            "backward_hessian must be HessianApproximation enum, got"
+            f" {type(spec.backward_hessian)}."
+        )
+    if spec.backward_hessian == HessianApproximation.FULL_HESSIAN_PROJECTED:
+        raise ValueError("FULL_HESSIAN_PROJECTED is only supported for forward_hessian")
+    if spec.backward_hessian == HessianApproximation.FULL_HESSIAN:
         direct_bw = {BackwardBackend.DIRECT_JAX_DENSE, BackwardBackend.DIRECT_CUDSS_FFI}
         if spec.effective_backward not in direct_bw:
             raise ValueError(
-                f"use_full_hessian=True requires backward_backend in {direct_bw}, "
+                "FULL_HESSIAN backward requires backward_backend in "
+                f"{direct_bw}, "
                 f"got effective backward={spec.effective_backward!r}. "
                 "Hint: set backward_backend=BackwardBackend.DIRECT_CUDSS_FFI."
             )
@@ -262,23 +279,19 @@ class OCPProcessor:
         dynamics, params = _build_params(spec, state_bounds, control_bounds)
         params["discretization_scheme"] = _DISCRETIZATION_CODE[spec.discretization]
         params["constrain_initial_control"] = spec.constrain_initial_control
+        params["use_slack_variables"] = spec.use_slack_variables
+        params["slack_penalization_weight"] = spec.slack_penalization_weight
         if spec.constrain_initial_control:
             params.setdefault("initial_control", jnp.zeros((dynamics.num_controls,)))
         params["rescale_optimization_variables"] = spec.rescale
-
-        if "slack" in spec.ocp_variant:
-            params["use_slack_variables"] = True
-            params["slack_penalization_weight"] = spec.slack_weight
-            ocp_cls = OptimalControlProblemSlack
-        else:
-            params["use_slack_variables"] = False
-            ocp_cls = OptimalControlProblem
 
         if "obstacle" in spec.ocp_variant:
             params["obstacles_centers"] = jnp.asarray(spec.obstacle_centers)
             params["obstacles_radii"] = jnp.asarray(spec.obstacle_radii)
             params["obstacles_dimension"] = spec.obstacle_dim
-            ocp_cls = OptimalControlProblemObstacle  # overrides slack if both
+            ocp_cls = OptimalControlProblemObstacle
+        else:
+            ocp_cls = OptimalControlProblem
 
         ocp = ocp_cls(dynamics=dynamics, params=params)
         return ocp, params
@@ -321,7 +334,7 @@ class SolverProcessor:
             sqp_iters=spec.num_sqp_iter,
             admm_max=spec.admm_max_iter,
         )
-        sp["linesearch"] = spec.linesearch
+        sp["linesearch"]["method"] = spec.linesearch_method
         sp["admm"]["sigma"] = spec.admm_sigma
         sp["admm"]["eps_abs"] = spec.admm_eps_abs
         sp["admm"]["eps_rel"] = spec.admm_eps_rel
@@ -341,7 +354,8 @@ class SolverProcessor:
             params=sp,
             forward_backend=spec.forward_backend,
             backward_backend=spec.effective_backward,
-            use_full_hessian=spec.use_full_hessian,
+            forward_hessian=spec.forward_hessian,
+            backward_hessian=spec.backward_hessian,
         )
 
     @staticmethod
@@ -408,7 +422,7 @@ def _is_tuple_field(spec_cls, field_name: str) -> bool:
     """True if the field's declared type is tuple (so we should NOT expand)."""
     for f in fields(spec_cls):
         if f.name == field_name:
-            # obstacle_centers, obstacle_radii, linesearch_alphas etc. are tuples
+            # Obstacle centers and radii are tuple-valued fields, not filters.
             return f.name in {"obstacle_centers", "obstacle_radii"}
     return False
 

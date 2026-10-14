@@ -2,7 +2,7 @@
 
 Imports the OCP/solver/rollout setup from ``pointmass_rl.py`` (no training is
 triggered; the training loop lives behind a ``__main__`` guard) and reuses
-``apply_ieee_style()`` and the TurboMPC blue from the linear-system benchmark
+``apply_ieee_style()`` and the TurboMPC blue from the linear system benchmark
 figures so all paper figures look uniform.
 
 Outputs (overwrites in place):
@@ -33,8 +33,11 @@ from matplotlib.lines import Line2D
 from matplotlib.transforms import Bbox
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
 
-sys.path.insert(0, str(REPO_ROOT / "benchmarking" / "linear-system" / "plot_results"))
-from plot_utils import SOLVER_COLORS, SOLVER_MARKERS, apply_ieee_style  # noqa: E402
+from benchmarking.linear_system.plot_results.plot_utils import (  # noqa: E402
+    SOLVER_COLORS,
+    SOLVER_MARKERS,
+    apply_ieee_style,
+)
 
 LEARNED_COLOR = SOLVER_COLORS["turbompc"]  # "#2166ac" — TurboMPC blue
 LEARNED_MARKER = SOLVER_MARKERS["turbompc"]  # "o"
@@ -49,6 +52,7 @@ OUTPUT_DIR = HERE / "outputs"
 # ────────────────────────────────────────────────────────────────────────────
 # Figure 1: learning curve
 # ────────────────────────────────────────────────────────────────────────────
+
 
 def make_learning_curve(
     out_stem: Path = OUTPUT_DIR / "pointmass_apg_500_curve",
@@ -69,16 +73,29 @@ def make_learning_curve(
     fig, ax = plt.subplots(figsize=(1.7, 1.35))
     # axhline first so "untrained" sits on top of the legend.
     ax.axhline(rmses[0], color=UNTRAINED_COLOR, ls="-", lw=0.8, label="untrained")
-    ax.plot(steps, rmses, "-", color=LEARNED_COLOR, lw=1.0,
-            marker=LEARNED_MARKER, markersize=2.5, label="learned",
-            markevery=2)
+    ax.plot(
+        steps,
+        rmses,
+        "-",
+        color=LEARNED_COLOR,
+        lw=1.0,
+        marker=LEARNED_MARKER,
+        markersize=2.5,
+        label="learned",
+        markevery=2,
+    )
 
     ax.set_xlabel("Training Step")
     ax.set_ylabel("RMSE")
     ax.set_xlim(0, 500)
     ax.grid(alpha=0.3, linestyle="--", linewidth=0.4)
-    ax.legend(loc="upper right", framealpha=0.9, handlelength=1.5,
-              borderpad=0.3, labelspacing=0.25)
+    ax.legend(
+        loc="upper right",
+        framealpha=0.9,
+        handlelength=1.5,
+        borderpad=0.3,
+        labelspacing=0.25,
+    )
 
     fig.tight_layout()
     fig.savefig(out_stem.with_suffix(".pdf"), bbox_inches="tight")
@@ -90,6 +107,7 @@ def make_learning_curve(
 # ────────────────────────────────────────────────────────────────────────────
 # Figure 2: 3D closed-loop trajectory
 # ────────────────────────────────────────────────────────────────────────────
+
 
 def _load_theta(npz_path: Path, template):
     import jax
@@ -105,11 +123,11 @@ def _load_theta(npz_path: Path, template):
 def make_trajectory_3d(
     out_stem: Path = OUTPUT_DIR / "pointmass_trajectory_3d",
 ) -> None:
-    from examples.pointmass_rl import pointmass_rl as pm
-    from examples.pointmass_rl.policy import init_policy
-
     import jax
     import jax.numpy as jnp
+
+    from examples.pointmass_rl import pointmass_rl as pm
+    from examples.pointmass_rl.policy import init_policy
 
     apply_ieee_style()
 
@@ -125,23 +143,45 @@ def make_trajectory_3d(
 
     fig = plt.figure(figsize=(2.1, 1.7))
     ax = fig.add_subplot(111, projection="3d")
-    ref_h, = ax.plot(tgt[:, 0], tgt[:, 1], tgt[:, 2], "-o",
-                     color=REFERENCE_COLOR, lw=0.9, ms=1.6,
-                     markevery=pm.SEGMENT_STEPS, label="reference")
-    unt_h, = ax.plot(st_init[1:, 0], st_init[1:, 1], st_init[1:, 2], "-",
-                     color=UNTRAINED_COLOR, lw=0.9, label="untrained")
+    (ref_h,) = ax.plot(
+        tgt[:, 0],
+        tgt[:, 1],
+        tgt[:, 2],
+        "-o",
+        color=REFERENCE_COLOR,
+        lw=0.9,
+        ms=1.6,
+        markevery=pm.SEGMENT_STEPS,
+        label="reference",
+    )
+    (unt_h,) = ax.plot(
+        st_init[1:, 0],
+        st_init[1:, 1],
+        st_init[1:, 2],
+        "-",
+        color=UNTRAINED_COLOR,
+        lw=0.9,
+        label="untrained",
+    )
 
     # Learned trajectory as a per-segment time gradient.
     pts = st_trained[1:, :3]
     segs = np.stack([pts[:-1], pts[1:]], axis=1)
-    lc = Line3DCollection(segs, cmap=TIME_CMAP,
-                          norm=plt.Normalize(0, len(pts) - 1), linewidths=1.3)
+    lc = Line3DCollection(
+        segs, cmap=TIME_CMAP, norm=plt.Normalize(0, len(pts) - 1), linewidths=1.3
+    )
     lc.set_array(np.arange(len(pts) - 1))
     ax.add_collection3d(lc)
 
-    start_h = ax.scatter(*np.asarray(pm.pos_target_at_step(0)),
-                         color="black", s=14, marker="s",
-                         facecolors="none", linewidth=0.9, label="start")
+    start_h = ax.scatter(
+        *np.asarray(pm.pos_target_at_step(0)),
+        color="black",
+        s=14,
+        marker="s",
+        facecolors="none",
+        linewidth=0.9,
+        label="start",
+    )
 
     allp = np.concatenate([tgt, st_init[1:, :3], pts], axis=0)
     ax.auto_scale_xyz(allp[:, 0], allp[:, 1], allp[:, 2])
@@ -150,17 +190,27 @@ def make_trajectory_3d(
     # panel when both are included at equal widths (this crop is ~12% wider).
     fs_ticks, fs_legend, fs_cb_label, fs_cb_ticks = 6.75, 7.9, 6.75, 6.2
 
-    learned_h = Line2D([], [], color=matplotlib.colormaps[TIME_CMAP](0.5),
-                       lw=1.3, label="learned")
+    learned_h = Line2D(
+        [], [], color=matplotlib.colormaps[TIME_CMAP](0.5), lw=1.3, label="learned"
+    )
     # 2x2 legend above the plot so it never occludes the trajectories.
-    ax.legend(handles=[ref_h, unt_h, learned_h, start_h], ncols=2,
-              loc="lower center", bbox_to_anchor=(0.5, 0.80),
-              bbox_transform=fig.transFigure, framealpha=0.9,
-              handlelength=1.5, borderpad=0.25, labelspacing=0.25,
-              columnspacing=1.0, fontsize=fs_legend)
+    ax.legend(
+        handles=[ref_h, unt_h, learned_h, start_h],
+        ncols=2,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.80),
+        bbox_transform=fig.transFigure,
+        framealpha=0.9,
+        handlelength=1.5,
+        borderpad=0.25,
+        labelspacing=0.25,
+        columnspacing=1.0,
+        fontsize=fs_legend,
+    )
 
-    cb = fig.colorbar(lc, ax=ax, orientation="horizontal",
-                      fraction=0.05, pad=0.14, shrink=0.65)
+    cb = fig.colorbar(
+        lc, ax=ax, orientation="horizontal", fraction=0.05, pad=0.14, shrink=0.65
+    )
     cb.set_label("time step", fontsize=fs_cb_label)
     cb.ax.tick_params(labelsize=fs_cb_ticks, width=0.5)
     cb.outline.set_linewidth(0.5)
@@ -185,8 +235,9 @@ def make_trajectory_3d(
     pad, bottom_extra = 0.05, 0.0
     fig.canvas.draw()
     tight = fig.get_tightbbox(fig.canvas.get_renderer())
-    bbox = Bbox.from_extents(tight.x0 - pad, tight.y0 - pad - bottom_extra,
-                             tight.x1 + pad, tight.y1 + pad)
+    bbox = Bbox.from_extents(
+        tight.x0 - pad, tight.y0 - pad - bottom_extra, tight.x1 + pad, tight.y1 + pad
+    )
     # dpi applies to the rasterized colorbar gradient inside the PDF.
     fig.savefig(out_stem.with_suffix(".pdf"), dpi=300, bbox_inches=bbox)
     fig.savefig(out_stem.with_suffix(".png"), dpi=300, bbox_inches=bbox)

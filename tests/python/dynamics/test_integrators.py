@@ -2,6 +2,7 @@
 
 import jax.numpy as jnp
 import numpy as np
+
 from turbompc.dynamics.integrators import get_state_trajectory
 from turbompc.dynamics.linear_dynamics import LinearDynamics
 from turbompc.problems.optimal_control_problem import OptimalControlProblem

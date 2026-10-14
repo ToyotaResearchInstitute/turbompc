@@ -4,6 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax import jacfwd
+
 from turbompc.utils.jax_utils import (
     jax_has_gpu,
     project_matrix_onto_positive_semidefinite_cone,

@@ -4,6 +4,7 @@ from time import time
 import jax.numpy as jnp
 import numpy as np
 import pytest
+
 from tests.helpers.assertions import (
     assert_box_bounds,
     assert_equality_residual,
@@ -19,14 +20,12 @@ from tests.helpers.problem_fixtures import (
 from tests.helpers.solver_fixtures import sqp_osqp_params, sqp_params
 from turbompc.dynamics.spacecraft_dynamics import SpacecraftDynamics
 from turbompc.problems.obstacle_avoidance import OptimalControlProblemObstacle
-from turbompc.problems.optimal_control_problem import (
-    OptimalControlProblem,
-    OptimalControlProblemSlack,
-)
+from turbompc.problems.optimal_control_problem import OptimalControlProblem
 from turbompc.solvers.qp_utils import pack_z
-from turbompc.solvers.sqp_diffmpc import SolverReturnStatus, SQPDiffMPCSolver
+from turbompc.solvers.sqp_diffmpc import SQPDiffMPCSolver
 from turbompc.solvers.sqp_osqp import SQPOSQPSolver
-from turbompc.utils.load_params import load_problem_params
+from turbompc.solvers.status import SQPStatus
+from turbompc.utils.load_params import load_problem_params, load_solver_params
 
 EQ_TOL = 1.0e-3
 Z_TOL = 1.0e-4
@@ -191,7 +190,7 @@ def test_sqp_osqp_matches_unconstrained_sqp_linear():
 
     solver_sqp = SQPDiffMPCSolver(program=problem, params=solver_params)
     sol_sqp = solver_sqp.solve(solver_sqp.initial_guess(params), problem_params=params)
-    assert sol_sqp.status == SolverReturnStatus.SUCCESS
+    assert sol_sqp.status == SQPStatus.SOLVED
 
 
 def test_sqp_osqp_slack_variables_resolve_infeasible_linear_ineq():
@@ -202,9 +201,9 @@ def test_sqp_osqp_slack_variables_resolve_infeasible_linear_ineq():
     params["state_max_bounds"] = jnp.ones((dynamics.num_states,)) * 0.05
     params["use_slack_variables"] = True
     params["slack_penalization_weight"] = 10.0
-
-    problem = OptimalControlProblemSlack(dynamics=dynamics, params=params)
-    solver = SQPOSQPSolver(program=problem)
+    problem = OptimalControlProblem(dynamics=dynamics, params=params)
+    solver_params = dict(load_solver_params("sqp_osqp.yaml"))
+    solver = SQPOSQPSolver(program=problem, params=solver_params)
     sol = solver.solve(problem_params=params)
 
     assert sol.status == 0
@@ -276,7 +275,7 @@ def test_sqp_osqp_matches_unconstrained_sqp(case):
     )
     solver_sqp = SQPDiffMPCSolver(program=problem, params=solver_sqp_params)
     sol_sqp = solver_sqp.solve(solver_sqp.initial_guess(params), problem_params=params)
-    assert sol_sqp.status == SolverReturnStatus.SUCCESS
+    assert sol_sqp.status == SQPStatus.SOLVED
     assert sol_sqp.convergence_error <= solver_sqp_params["tol_convergence"]
 
     z_osqp = pack_z(sol_osqp.states, sol_osqp.controls)
