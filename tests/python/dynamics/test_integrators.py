@@ -86,3 +86,45 @@ def test_time_varying_dynamics_params_respected():
     params["dynamics_state_dot_params"] = dynamics_params
     constraints = problem.equality_constraints(states, controls, params)
     np.testing.assert_allclose(constraints, jnp.zeros_like(constraints), atol=1e-6)
+
+
+def test_time_varying_implicit_dynamics_params_respected():
+    params = load_problem_params("linear.yaml")
+    params = dict(params)
+    params["horizon"] = 4
+    params["discretization_scheme"] = 10  # implicit trapezoidal
+    dynamics = LinearDynamics()
+    problem = OptimalControlProblem(dynamics=dynamics, params=params)
+
+    rng = np.random.default_rng(1)
+    controls = jnp.array(
+        rng.standard_normal((problem.horizon + 1, dynamics.num_controls))
+    )
+    initial_state = jnp.array(rng.standard_normal((dynamics.num_states,)))
+
+    A_seq = jnp.array(
+        rng.standard_normal(
+            (problem.horizon + 1, dynamics.num_states, dynamics.num_states)
+        )
+    )
+    B_seq = jnp.array(
+        rng.standard_normal(
+            (problem.horizon + 1, dynamics.num_states, dynamics.num_controls)
+        )
+    )
+    b_seq = jnp.array(rng.standard_normal((problem.horizon + 1, dynamics.num_states)))
+    dynamics_params = {"A": A_seq, "B": B_seq, "b": b_seq}
+
+    states = get_state_trajectory(
+        dynamics,
+        float(params["discretization_resolution"]),
+        problem.discretization_scheme,
+        dynamics_params,
+        initial_state,
+        controls,
+    )
+
+    params["initial_state"] = initial_state
+    params["dynamics_state_dot_params"] = dynamics_params
+    constraints = problem.equality_constraints(states, controls, params)
+    np.testing.assert_allclose(constraints, jnp.zeros_like(constraints), atol=1e-6)
