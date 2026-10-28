@@ -160,7 +160,7 @@ The CUDA install normally provides cuDSS through the `nvidia-cudss-cu12`
 package. Confirm it is installed, then rebuild:
 
 ```bash
-python -m pip install "nvidia-cudss-cu12>=0.8"
+python -m pip install "nvidia-cudss-cu12>=1.0,<2"
 TURBOMPC_CUDA=ON python -m pip install -e ".[cuda12]"
 ```
 

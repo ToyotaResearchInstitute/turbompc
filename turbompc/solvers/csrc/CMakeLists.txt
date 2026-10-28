@@ -75,7 +75,7 @@ if(TURBOMPC_CUDSS)
     NO_DEFAULT_PATH
   )
   if(NOT CUDSS_LIB)
-    # pip nvidia-cudss-cu12 ships libcudss.so.0 without an unversioned symlink
+    # pip nvidia-cudss-cu12 ships libcudss.so.<major> without an unversioned symlink
     file(GLOB _CUDSS_SO0
       "${NVIDIA_CU12_DIR}/lib/libcudss.so.*"
       "${CUDSS_DIR}/lib/libcudss.so.*"
@@ -197,7 +197,7 @@ elseif(TURBOMPC_CUDSS)
     "cuDSS not found. ADMM_FUSED_CUDSS and DIRECT_CUDSS_FFI are the TurboMPCSolver "
     "defaults, so building without them produces an install whose default "
     "configuration fails at runtime.\n"
-    "  Fix:  pip install 'nvidia-cudss-cu12>=0.8'\n"
+    "  Fix:  pip install 'nvidia-cudss-cu12>=1.0,<2'\n"
     "  Or:   configure with -DCUDSS_DIR=<path> (https://developer.nvidia.com/cudss)\n"
     "  Or:   configure with -DTURBOMPC_CUDSS=OFF for a deliberate PCG-only build")
 else()

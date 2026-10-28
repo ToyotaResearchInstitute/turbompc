@@ -6,7 +6,7 @@ import os
 import shutil
 from pathlib import Path
 
-CUDA_BUILD_REQUIRES = ["nvidia-cudss-cu12>=0.8"]
+CUDA_BUILD_REQUIRES = ["nvidia-cudss-cu12>=1.0,<2"]
 ENV_VAR = "TURBOMPC_CUDA"
 _TRUTHY = frozenset({"1", "TRUE", "YES", "ON"})
 _FALSY = frozenset({"0", "FALSE", "NO", "OFF"})

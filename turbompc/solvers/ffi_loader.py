@@ -17,6 +17,7 @@ _NVIDIA_LIB_STEMS = (
     "libcublasLt",
     "libcublas",
     "libcusparse",
+    "libnvrtc",
     "libcudss",
 )
 

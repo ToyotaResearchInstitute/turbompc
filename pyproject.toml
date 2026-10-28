@@ -35,7 +35,7 @@ dependencies = [
 cuda12 = [
     "jax[cuda12]>=0.6.2,<0.7",
     "nvidia-cusparse-cu12",
-    "nvidia-cudss-cu12>=0.8",
+    "nvidia-cudss-cu12>=1.0,<2",
 ]
 gpu = ["turbompc[cuda12]"]
 rl = ["torch", "diffrax>=0.6.2"]

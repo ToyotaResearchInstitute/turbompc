@@ -67,7 +67,7 @@ struct SparseKktWorkspace {
         const auto* row_ptr_host = host_row_ptr.data();
         const auto* col_idx_host = host_col_idx.data();
         const size_t scalar_size = static_cast<size_t>(dtype_bytes);
-        const cudssDataType_t value_type = dtype_bytes == 8 ? CUDSS_R_64F : CUDSS_R_32F;
+        const cudaDataType_t value_type = dtype_bytes == 8 ? CUDSS_R_64F : CUDSS_R_32F;
         turbompc::FfiAllocate(allocator, &row_ptr, static_cast<size_t>(n + 1) * sizeof(int32_t));
         turbompc::FfiAllocate(allocator, &col_idx, static_cast<size_t>(nnz) * sizeof(int32_t));
         CUDA_CHECK(cudaMemcpy(row_ptr, row_ptr_host,
@@ -92,6 +92,11 @@ struct SparseKktWorkspace {
         cudssReorderingAlg_t reorder_alg = CUDSS_REORDERING_ALG_DEFAULT;
         CUDSS_CHECK(cudssConfigSet(config, CUDSS_CONFIG_REORDERING_ALG,
                                    &reorder_alg, sizeof(reorder_alg)));
+        // cuDSS >= 1.0 enables value-based matching by default, but analysis
+        // runs on placeholder zeros here.
+        cudssMatchingAlg_t matching_alg = CUDSS_MATCHING_ALG_NONE;
+        CUDSS_CHECK(cudssConfigSet(config, CUDSS_CONFIG_MATCHING_ALG,
+                                   &matching_alg, sizeof(matching_alg)));
         CUDSS_CHECK(cudssMatrixCreateCsr(
             &matA, n, n, nnz, row_ptr, nullptr, col_idx, placeholder_values,
             CUDSS_R_32I, CUDSS_R_32I, value_type, CUDSS_MTYPE_SYMMETRIC,

@@ -1052,7 +1052,7 @@ static void ensureWorkspaceCapacity(turbompc::FfiDeviceAllocator& allocator,
         ? (size_t)n * n
         : (size_t)(3 * T_blocks - 2) * n * n;
     const size_t nnz = (size_t)Nb * nnz_per_sys;
-    const cudssDataType_t valueType = std::is_same_v<T, float>
+    const cudaDataType_t valueType = std::is_same_v<T, float>
         ? CUDSS_R_32F : CUDSS_R_64F;
 
     turbompc::FfiAllocate(allocator, &entry->d_x, (size_t)Nb * total_tn * sizeof(T));
@@ -1100,6 +1100,10 @@ static void ensureWorkspaceCapacity(turbompc::FfiDeviceAllocator& allocator,
     cudssReorderingAlg_t reorder_alg = CUDSS_REORDERING_ALG_DEFAULT;
     CUDSS_CHECK(cudssConfigSet(entry->config, CUDSS_CONFIG_REORDERING_ALG,
                                &reorder_alg, sizeof(reorder_alg)));
+    // cuDSS >= 1.0 enables matching by default; the regularized KKT does not need it.
+    cudssMatchingAlg_t matching_alg = CUDSS_MATCHING_ALG_NONE;
+    CUDSS_CHECK(cudssConfigSet(entry->config, CUDSS_CONFIG_MATCHING_ALG,
+                               &matching_alg, sizeof(matching_alg)));
     CUDSS_CHECK(cudssMatrixCreateCsr(
         &entry->matA, total, total, nnz, entry->csr_indptr, nullptr,
         entry->csr_indices, (T*)entry->csr_data, CUDSS_R_32I, CUDSS_R_32I,

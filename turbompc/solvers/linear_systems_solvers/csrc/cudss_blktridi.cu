@@ -69,6 +69,11 @@ public:
       cudss_allocator_ = allocator;
       CheckCudss(turbompc::SetCudssDeviceMemory(handle_, cudss_allocator_), "cudssSetDeviceMemHandler");
       CheckCudss(cudssConfigCreate(&config_), "cudssConfigCreate");
+      // cuDSS >= 1.0 enables matching by default; the Schur system does not need it.
+      cudssMatchingAlg_t matching_alg = CUDSS_MATCHING_ALG_NONE;
+      CheckCudss(cudssConfigSet(config_, CUDSS_CONFIG_MATCHING_ALG,
+                                &matching_alg, sizeof(matching_alg)),
+                 "cudssConfigSet(MATCHING_ALG)");
       CheckCudss(cudssDataCreate(handle_, &data_), "cudssDataCreate");
       CheckCuda(cudaEventCreateWithFlags(&completion_event_, cudaEventDisableTiming), "cudaEventCreateWithFlags");
     } catch (...) {
@@ -138,7 +143,7 @@ public:
       }
     }
 
-    const cudssDataType_t value_type = std::is_same_v<Scalar, float> ? CUDSS_R_32F : CUDSS_R_64F;
+    const cudaDataType_t value_type = std::is_same_v<Scalar, float> ? CUDSS_R_32F : CUDSS_R_64F;
     if (matA_ == nullptr) {
       CheckCudss(cudssMatrixCreateCsr(
                      &matA_, total_, total_, nnz_, indptr_, nullptr, indices_,
