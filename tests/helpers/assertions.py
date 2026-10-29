@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 
+from turbompc.solvers.status import SQPStatus
 
-def assert_solution_nontrivial(sol, *, atol: float = 1e-8):
-    assert sol.status == 0
+
+def assert_solution_nontrivial(
+    sol, *, atol: float = 1e-8, allow_max_iter: bool = False
+):
+    accepted = {SQPStatus.SOLVED}
+    if allow_max_iter:
+        accepted.add(SQPStatus.MAX_ITER)
+    assert int(sol.status) in accepted, f"Unexpected solver status: {sol.status}"
     assert jnp.isfinite(sol.states).all()
     assert jnp.isfinite(sol.controls).all()
     assert float(jnp.max(jnp.abs(sol.states))) > atol

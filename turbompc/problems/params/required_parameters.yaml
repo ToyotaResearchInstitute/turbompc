@@ -26,7 +26,7 @@ weights_penalization_control_rate: [0., 0.]
 # (not required)
 
 # slack variables on inequality constraints
-# (not necessarily needed if not using slack variables problem class)
+# (optional; slack_penalization_weight is required when enabled)
 # use_slack_variables: False
 # slack_penalization_weight: 0.0
 

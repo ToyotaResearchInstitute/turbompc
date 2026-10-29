@@ -3,6 +3,7 @@
 import os
 from typing import Any, Dict
 
+import jax
 import jax.numpy as jnp
 import yaml
 
@@ -86,6 +87,7 @@ def load_problem_params(params_yaml_filename: str) -> Dict[str, Any]:
         "penalize_control_reference",
         "rescale_optimization_variables",
         "constrain_initial_control",
+        "use_slack_variables",
         "dynamics_state_dot_params",
     ]
     for key in params:
@@ -96,9 +98,11 @@ def load_problem_params(params_yaml_filename: str) -> Dict[str, Any]:
         if dyn_params is None:
             params["dynamics_state_dot_params"] = None
         else:
-            params["dynamics_state_dot_params"] = {
-                k: jnp.array(v) for k, v in dyn_params.items()
-            }
+            params["dynamics_state_dot_params"] = jax.tree.map(
+                lambda value: None if value is None else jnp.array(value),
+                dyn_params,
+                is_leaf=lambda value: not isinstance(value, dict),
+            )
 
     # duplicated over time
     params["reference_state_trajectory"] = jnp.repeat(

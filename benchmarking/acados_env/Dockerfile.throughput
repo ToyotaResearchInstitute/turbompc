@@ -1,0 +1,6 @@
+ARG ACADOS_BASE_IMAGE=turbompc-acados:latest
+FROM ${ACADOS_BASE_IMAGE}
+
+# The linear-system training benchmark also fits PyTorch actor/critic networks.
+RUN python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+RUN python -m pip install pyyaml

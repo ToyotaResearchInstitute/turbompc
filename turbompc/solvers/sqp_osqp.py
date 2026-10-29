@@ -15,9 +15,11 @@ import jax.numpy as jnp
 import numpy as np
 import osqp
 import scipy.sparse as sp
-from turbompc.problems.optimal_control_problem import (
-    OptimalControlProblem,
-    SlackProblemAdapter,
+
+from turbompc.problems.optimal_control_problem import OptimalControlProblem
+from turbompc.solvers.constraint_handling import (
+    ConstraintHandling,
+    _validate_constraint_settings,
 )
 from turbompc.solvers.linesearch import (
     backtracking_linesearch,
@@ -25,6 +27,7 @@ from turbompc.solvers.linesearch import (
 )
 from turbompc.solvers.qp_data import QPData, qpdata_from_ocp_blocks, scale_qp_data
 from turbompc.solvers.qp_utils import ZShape, pack_z, unpack_z
+from turbompc.solvers.status import SQPStatus
 from turbompc.utils.jax_utils import project_matrix_onto_positive_semidefinite_cone
 from turbompc.utils.load_params import load_solver_params
 
@@ -36,7 +39,7 @@ class SQPOSQPSolution:
     states: jnp.ndarray  # (N+1, nx)
     controls: jnp.ndarray  # (N+1, nu)
     slack: jnp.ndarray  # (N+1, m)
-    status: int  # 0 success, negative failure
+    status: SQPStatus
     num_iter: int
     convergence_error: float
     iters: np.ndarray  # (num_iter,) OSQP iterations each SQP iteration
@@ -53,15 +56,6 @@ class SQPOSQPSolver:
         where states.shape=(N+1,nx), controls.shape=(N+1,nu)
     """
 
-    STATUS_SUCCESS = 0
-    STATUS_OSQP_FAILED = -1
-    STATUS_NAN_DETECTED = -2
-
-    _supported_program_types = [
-        OptimalControlProblem,
-        SlackProblemAdapter,
-    ]
-
     def __init__(
         self,
         program: OptimalControlProblem,
@@ -71,17 +65,23 @@ class SQPOSQPSolver:
         self._program = program
         self._name = name
         self._params = DEFAULT_SOLVER_PARAMS if params is None else params
+        self._constraint_handling = _validate_constraint_settings(
+            self._params,
+            program.use_slack_variables,
+            program.slack_penalization_weight,
+        )
+        self._use_slack_variables = program.use_slack_variables
+        if self._constraint_handling != ConstraintHandling.PROJECTION:
+            raise NotImplementedError(
+                "SQPOSQPSolver supports only constraint_handling='projection'"
+            )
 
         if self.params["verbose"]:
             print("Initializing Solver with")
             print("> name    =", name)
             print("> program =", program)
 
-        program_is_supported = False
-        for supported_program_type in self._supported_program_types:
-            if isinstance(program, supported_program_type):
-                program_is_supported = True
-        if not program_is_supported:
+        if not isinstance(program, OptimalControlProblem):
             raise NotImplementedError(str(program.name) + " is not supported.")
 
         self._zshape = ZShape(
@@ -124,7 +124,16 @@ class SQPOSQPSolver:
         states: jnp.ndarray,
         controls: jnp.ndarray,
         problem_params: Dict[str, Any],
+        slack_penalization_weight: Optional[jnp.ndarray] = None,
     ) -> QPData:
+        if slack_penalization_weight is None:
+            slack_penalization_weight = jnp.asarray(
+                problem_params.get(
+                    "slack_penalization_weight",
+                    self.program.slack_penalization_weight,
+                ),
+                dtype=states.dtype,
+            )
         D, E, q = self.program.get_cost_linearized_blocks(
             states, controls, problem_params
         )
@@ -137,10 +146,6 @@ class SQPOSQPSolver:
         )
         ineq_blocks, ineq_l, ineq_u = self.program.get_inequalities_linearized_matrices(
             states, controls, problem_params
-        )
-        use_slack_variables = self.program.use_slack_variables
-        slack_penalization_weight = jnp.asarray(
-            problem_params.get("slack_penalization_weight", 0.0), dtype=states.dtype
         )
         A0, c0 = self.program.get_initial_equality_linearized_matrices(
             problem_params, states.dtype
@@ -159,7 +164,6 @@ class SQPOSQPSolver:
             ineq_blocks=ineq_blocks,
             ineq_l=ineq_l,
             ineq_u=ineq_u,
-            use_slack_variables=use_slack_variables,
             slack_penalization_weight=slack_penalization_weight,
         )
         if problem_params.get("rescale_optimization_variables", False):
@@ -178,7 +182,12 @@ class SQPOSQPSolver:
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Compute constraint violations and return inequality bounds."""
         return evaluate_constraints_with_bounds(
-            self.program, states, controls, slacks, problem_params
+            self.program,
+            states,
+            controls,
+            slacks,
+            problem_params,
+            norm=jnp.inf,
         )
 
     def linesearch(
@@ -209,6 +218,7 @@ class SQPOSQPSolver:
         states: jnp.ndarray,
         controls: jnp.ndarray,
         problem_params: Dict[str, Any],
+        slack_penalization_weight: Optional[jnp.ndarray] = None,
     ) -> Tuple[
         jnp.ndarray,
         jnp.ndarray,
@@ -237,7 +247,9 @@ class SQPOSQPSolver:
             l_ineq: (m_ineq,)
             u_ineq: (m_ineq,)
         """
-        qp_data = self._build_qp_data(states, controls, problem_params)
+        qp_data = self._build_qp_data(
+            states, controls, problem_params, slack_penalization_weight
+        )
         N = self.program.horizon
         nx = self.program.num_state_variables
         n = qp_data.cost.D.shape[1]
@@ -273,12 +285,8 @@ class SQPOSQPSolver:
                 qp_data.eq.A_plus[t]
             )
 
-        use_slack_variables = problem_params.get("use_slack_variables", False)
-        if use_slack_variables and not isinstance(self.program, SlackProblemAdapter):
-            raise ValueError(
-                "use_slack_variables=True requires a SlackProblemAdapter instance."
-            )
-        slack_penalization_weight = problem_params.get("slack_penalization_weight", 0.0)
+        use_slack_variables = self._use_slack_variables
+        slack_penalization_weight = qp_data.ineq.slack_penalization_weight
 
         if qp_data.ineq.G.shape[0] > 0:
             m_ineq = qp_data.ineq.G.shape[1]
@@ -457,6 +465,18 @@ class SQPOSQPSolver:
             states, controls = self.program.initial_guess(problem_params)
         else:
             states, controls = initial_guess
+        slack_penalization_weight = jnp.asarray(
+            weights.get(
+                "slack_penalization_weight",
+                problem_params.get(
+                    "slack_penalization_weight",
+                    self.program.slack_penalization_weight,
+                ),
+            ),
+            dtype=states.dtype,
+        )
+        if slack_penalization_weight.ndim != 0:
+            raise ValueError("slack_penalization_weight must be a scalar")
         N = self.program.horizon
         n = states.shape[1] + controls.shape[1]
         nz = (N + 1) * n
@@ -470,7 +490,7 @@ class SQPOSQPSolver:
 
         z_prev = self._pack(states, controls)
         convergence_error = np.inf
-        status = 0
+        status = SQPStatus.NOT_RUN
 
         # Initialize stat arrays
         qp_define_times = np.zeros(maxiter, dtype=float)
@@ -482,7 +502,7 @@ class SQPOSQPSolver:
         total_times = np.zeros(maxiter, dtype=float)
 
         # Slack placeholder for linesearch/backtracking
-        if problem_params.get("use_slack_variables", False):
+        if self._use_slack_variables:
             slack = jnp.zeros(
                 (N + 1, self.program.num_inequality_constraints), dtype=states.dtype
             )
@@ -493,7 +513,7 @@ class SQPOSQPSolver:
         for k in range(maxiter):
             tt0 = time()
             P, q, Aeq, beq, Aineq, l_ineq, u_ineq = self._build_qp_matrices_dense(
-                states, controls, problem_params
+                states, controls, problem_params, slack_penalization_weight
             )
             P = np.array(P)
             q = np.array(q)
@@ -519,12 +539,12 @@ class SQPOSQPSolver:
             admm_num_iters[k] = iters[k]
 
             if result.info.status != "solved":
-                status = -1
+                status = SQPStatus.QP_FAILED
                 slack = jnp.zeros((N + 1, 0), dtype=states.dtype)
                 break
 
             z_new = jnp.array(result.x, dtype=states.dtype)
-            if problem_params.get("use_slack_variables", False) and Aineq.shape[0] > 0:
+            if self._use_slack_variables and Aineq.shape[0] > 0:
                 n_base = nz
                 z_primal = z_new[:n_base]
                 slack_candidate = z_new[n_base:].reshape((N + 1, -1))
@@ -564,12 +584,17 @@ class SQPOSQPSolver:
                 ord=jnp.inf,
             )
 
-            ineq_values, ineq_lower, ineq_upper = self.program.inequality_constraints(
-                states_new, controls_new, problem_params
-            )
-            if problem_params.get("use_slack_variables", False):
-                ineq_values, _, _ = self.program.inequality_constraints_with_slack(
-                    states_new, controls_new, slack, problem_params
+            if self._use_slack_variables:
+                ineq_values, ineq_lower, ineq_upper = (
+                    self.program.inequality_constraints_with_slack(
+                        states_new, controls_new, slack, problem_params
+                    )
+                )
+            else:
+                ineq_values, ineq_lower, ineq_upper = (
+                    self.program.inequality_constraints(
+                        states_new, controls_new, problem_params
+                    )
                 )
             ineq_values = ineq_values.reshape(-1)
             ineq_lower = ineq_lower.reshape(-1)
@@ -586,7 +611,8 @@ class SQPOSQPSolver:
             z_prev = z_new
             states, controls = states_new, controls_new
 
-            if convergence_error <= self.params["tol_convergence"]:
+            # One-step solves report MAX_ITER after completing the loop.
+            if maxiter > 1 and convergence_error <= self.params["tol_convergence"]:
                 num_completed = k + 1
                 iters = iters[:num_completed]
                 if linesearch_alphas is not None:
@@ -608,7 +634,7 @@ class SQPOSQPSolver:
                     states=states,
                     controls=controls,
                     slack=slack,
-                    status=0,
+                    status=SQPStatus.SOLVED,
                     num_iter=num_completed,
                     convergence_error=convergence_error,
                     iters=iters,
@@ -630,6 +656,16 @@ class SQPOSQPSolver:
             "convergence_errors": convergence_errors[:num_completed],
             "total_times": total_times[:num_completed],
         }
+        if status == SQPStatus.NOT_RUN:
+            finite = (
+                np.all(np.isfinite(states))
+                and np.all(np.isfinite(controls))
+                and np.isfinite(convergence_error)
+            )
+            if not finite:
+                status = SQPStatus.NONFINITE
+            else:
+                status = SQPStatus.MAX_ITER
         return SQPOSQPSolution(
             states=states,
             controls=controls,

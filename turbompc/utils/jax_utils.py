@@ -1,12 +1,20 @@
 """Helper functions for jax such as autodifferentiation."""
 
 from functools import partial
-from typing import Callable, Tuple
+from typing import Any, Callable, Tuple
 
 import jax
 import jax.numpy as jnp
 from jax import jvp, vmap
 from jax._src.api_util import check_callable
+
+
+def tree_all_finite(tree: Any) -> jnp.ndarray:
+    """Return whether every array in a JAX pytree is finite."""
+    finite = jnp.asarray(True)
+    for leaf in jax.tree.leaves(tree):
+        finite = finite & jnp.all(jnp.isfinite(leaf))
+    return finite
 
 
 def value_and_jacfwd(

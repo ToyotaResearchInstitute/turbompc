@@ -2,11 +2,13 @@
 import jax.numpy as jnp
 import numpy as np
 import pytest
+
 from tests.helpers.problem_fixtures import tile_spacecraft_inertia
 from tests.helpers.solver_fixtures import sqp_params
 from turbompc.dynamics.spacecraft_dynamics import SpacecraftDynamics
 from turbompc.problems.optimal_control_problem import OptimalControlProblem
-from turbompc.solvers.sqp_diffmpc import SolverReturnStatus, SQPDiffMPCSolver
+from turbompc.solvers.sqp_diffmpc import SQPDiffMPCSolver
+from turbompc.solvers.status import SQPStatus
 from turbompc.utils.load_params import load_problem_params
 
 
@@ -21,7 +23,15 @@ def generate_problem_data(num_batch, seed):
     return jnp.array(inertia_vector), jnp.array(initial_states)
 
 
-def sqp_solve_spacecraft(num_batch, horizon, use_linesearch, warm_start_backward):
+def sqp_solve_spacecraft(
+    num_batch,
+    horizon,
+    use_linesearch,
+    warm_start_backward,
+    *,
+    sqp_iters=20,
+    tolerance=1.0e-6,
+):
     problem_params = load_problem_params("spacecraft.yaml")
     inertia_vector, initial_states = generate_problem_data(num_batch, seed=0)
     turbompc_horizon = horizon - 1  # turbompc horizon is N+1
@@ -35,8 +45,8 @@ def sqp_solve_spacecraft(num_batch, horizon, use_linesearch, warm_start_backward
     problem_params["weights_penalization_final_state"] = jnp.zeros(3)
 
     solver_params = sqp_params(
-        tol=1.0e-6,
-        sqp_iters=20,
+        tol=tolerance,
+        sqp_iters=sqp_iters,
         pcg_eps=1.0e-12,
         linesearch=use_linesearch,
         warm_start_backward=warm_start_backward,
@@ -66,6 +76,20 @@ def sqp_solve_spacecraft(num_batch, horizon, use_linesearch, warm_start_backward
     return solver, sqp_guess, solution, dynamics
 
 
+def test_single_iteration_reports_max_iter():
+    _, _, solution, _ = sqp_solve_spacecraft(
+        1,
+        10,
+        False,
+        False,
+        sqp_iters=1,
+        tolerance=1.0e6,
+    )
+
+    assert solution.num_iter == 1
+    assert solution.status == SQPStatus.MAX_ITER
+
+
 @pytest.mark.parametrize("num_batch", [1, 2])
 @pytest.mark.parametrize("horizon", [10, 20])
 @pytest.mark.parametrize("use_linesearch", [True, False])
@@ -80,7 +104,8 @@ def test_sqp_solve(num_batch, horizon, use_linesearch, warm_start_backward):
     assert sqp_guess.states.shape == (horizon, dynamics.num_states)
     assert sqp_guess.controls.shape == (horizon, dynamics.num_controls)
     assert sqp_guess.dual.shape == (horizon, dynamics.num_states)
-    assert solution.status == SolverReturnStatus.SUCCESS
+    assert sqp_guess.status == SQPStatus.NOT_RUN
+    assert solution.status == SQPStatus.SOLVED
     assert jnp.isfinite(solution.convergence_error)
 
 
@@ -91,7 +116,7 @@ def test_sqp_solve_warmstart():
         _, _, solution, _ = sqp_solve_spacecraft(
             num_batch, horizon, use_linesearch, warm_start_backward
         )
-        assert solution.status == SolverReturnStatus.SUCCESS
+        assert solution.status == SQPStatus.SOLVED
         assert jnp.isfinite(solution.convergence_error)
         if warm_start_backward:
             num_iters["warm"] = solution.num_iter

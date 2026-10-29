@@ -1,5 +1,11 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-docker build -t turbompc-acados:latest -f Dockerfile .
+docker build \
+  --build-arg ACADOS_REF=v0.6.0 \
+  -t turbompc-acados:v0.6.0 \
+  -t turbompc-acados:latest \
+  -f Dockerfile \
+  .
+
 echo "✓ acados Docker image built successfully"

@@ -9,12 +9,17 @@ without stacking @pytest.mark.parametrize decorators in each test.
 import jax
 import jax.numpy as jnp
 import pytest
+
 from tests.cuda.helpers.processors import OCPProcessor, OCPSpec, SolverProcessor
 from tests.helpers.assertions import (
     assert_equality_residual,
     assert_solution_nontrivial,
 )
-from turbompc.solvers.turbompc_solver import BackwardBackend, ForwardBackend
+from turbompc.solvers.turbompc_solver import (
+    BackwardBackend,
+    ForwardBackend,
+    HessianApproximation,
+)
 
 CUDA_DEFAULT_FORWARD_BACKENDS = [ForwardBackend.ADMM_FUSED_CUDSS]
 CUDA_EXTENDED_FORWARD_BACKENDS = [
@@ -167,7 +172,10 @@ def test_cuda_admm_hyperparams(solver_spec):
     SolverProcessor.parametrize(
         forward_backend=[ForwardBackend.ADMM_FUSED_CUDSS],
         backward_backend=[BackwardBackend.DIRECT_CUDSS_FFI],
-        use_full_hessian=[False, True],
+        backward_hessian=[
+            HessianApproximation.GAUSS_NEWTON,
+            HessianApproximation.FULL_HESSIAN,
+        ],
     ),
 )
 def test_cuda_full_hessian_gradient(ocp_spec, solver_spec):
@@ -255,8 +263,8 @@ def test_cuda_mutate_slack_weight_resolve(solver_spec):
         OCPSpec(
             dynamics="linear",
             horizon=5,
-            ocp_variant="slack",
-            slack_weight=1.0,
+            use_slack_variables=True,
+            slack_penalization_weight=1e3,
         )
     )
     params["control_min_bounds"] = -jnp.ones_like(params["control_min_bounds"]) * 0.05

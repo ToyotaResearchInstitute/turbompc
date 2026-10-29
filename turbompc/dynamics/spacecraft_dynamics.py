@@ -3,6 +3,7 @@
 from typing import Any, Dict
 
 import jax.numpy as jnp
+
 from turbompc.dynamics.base_dynamics import Dynamics
 
 spacecraft_parameters: Dict[str, Any] = {

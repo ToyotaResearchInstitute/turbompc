@@ -1,4 +1,5 @@
 import numpy as np
+
 from turbompc.solvers.linear_systems_solvers.backends import SchurSolverBackend
 from turbompc.solvers.linear_systems_solvers.linear_solve import (
     block_tridi_apply,

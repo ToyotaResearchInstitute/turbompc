@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
@@ -54,31 +54,19 @@ class QPInequalityBlocks:
     G: jnp.ndarray  # (N+1, m, n)
     l: jnp.ndarray  # (N+1, m)
     u: jnp.ndarray  # (N+1, m)
-    slack_penalization_weight: jnp.ndarray = field(
-        default_factory=lambda: jnp.array(0.0)
-    )
-    use_slack_variables: bool = False
+    slack_penalization_weight: jnp.ndarray  # scalar
 
     def tree_flatten(self):
-        children = (
-            self.G,
-            self.l,
-            self.u,
-            self.slack_penalization_weight,
-        )
-        aux_data = (self.use_slack_variables,)
-        return children, aux_data
+        return (self.G, self.l, self.u, self.slack_penalization_weight), None
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         G, l, u, slack_penalization_weight = children
-        (use_slack_variables,) = aux_data
         return cls(
             G=G,
             l=l,
             u=u,
             slack_penalization_weight=slack_penalization_weight,
-            use_slack_variables=use_slack_variables,
         )
 
 
@@ -125,15 +113,13 @@ def _inequality_blocks_from_ocp_mats(
     ineq_blocks: jnp.ndarray,
     ineq_l: jnp.ndarray,
     ineq_u: jnp.ndarray,
-    use_slack_variables: bool = False,
-    slack_penalization_weight: jnp.ndarray = jnp.array(0.0),
+    slack_penalization_weight: jnp.ndarray,
 ) -> QPInequalityBlocks:
     return QPInequalityBlocks(
         G=ineq_blocks,
         l=ineq_l,
         u=ineq_u,
         slack_penalization_weight=slack_penalization_weight,
-        use_slack_variables=use_slack_variables,
     )
 
 
@@ -151,8 +137,7 @@ def qpdata_from_ocp_blocks(
     ineq_blocks: jnp.ndarray,
     ineq_l: jnp.ndarray,
     ineq_u: jnp.ndarray,
-    use_slack_variables: bool = False,
-    slack_penalization_weight: jnp.ndarray = jnp.array(0.0),
+    slack_penalization_weight: jnp.ndarray,
 ) -> QPData:
     """Build QPData from OCP linearization blocks."""
     cost = QPCostBlocks(D=D, E=E, q=q)
@@ -169,7 +154,6 @@ def qpdata_from_ocp_blocks(
         ineq_blocks=ineq_blocks,
         ineq_l=ineq_l,
         ineq_u=ineq_u,
-        use_slack_variables=use_slack_variables,
         slack_penalization_weight=slack_penalization_weight,
     )
     return QPData(cost=cost, eq=eq, ineq=ineq)
@@ -203,7 +187,6 @@ def scale_qp_data(
         l=ineq.l,
         u=ineq.u,
         slack_penalization_weight=ineq.slack_penalization_weight,
-        use_slack_variables=ineq.use_slack_variables,
     )
     eq_scaled = QPEqualityBlocks(A0=A0, A_minus=A_minus, A_plus=A_plus, c0=c0, c=c)
     cost_scaled = QPCostBlocks(D=D, E=E, q=q)

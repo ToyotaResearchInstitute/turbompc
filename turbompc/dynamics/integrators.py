@@ -5,6 +5,7 @@ from typing import Dict
 
 import jax.numpy as jnp
 from jax.lax import scan
+
 from turbompc.dynamics.base_dynamics import Dynamics
 from turbompc.utils.jax_utils import value_and_jacfwd
 

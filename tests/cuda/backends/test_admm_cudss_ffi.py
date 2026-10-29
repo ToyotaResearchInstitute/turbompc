@@ -1,7 +1,6 @@
 """Tests for the cuDSS-loop ADMM FFI backend (admm_cudss.cu / admm_cudss_ffi.cc)."""
 from __future__ import annotations
 
-import ctypes
 import re
 from pathlib import Path
 
@@ -9,9 +8,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+
 from tests.cuda.helpers.processors import OCPProcessor, OCPSpec
 from tests.helpers.backend_utils import backend_available
+from tests.helpers.constraint_handling_fixtures import HANDLINGS
+from tests.helpers.solver_fixtures import build_gauss_newton_qp
 from turbompc.solvers.admm.admm import ADMMState, compute_S_Phiinv
+from turbompc.solvers.constraint_handling import ConstraintHandling
 from turbompc.solvers.linear_systems_solvers.pcg_primal import SchurComplementMatrices
 from turbompc.solvers.qp_data import (
     QPCostBlocks,
@@ -62,7 +65,9 @@ def _build_qp(horizon: int):
         params={
             "num_sqp_iteration_max": 1,
             "tol_convergence": 1e-6,
-            "linesearch": False,
+            "linesearch": {"method": "none"},
+            "constraint_handling": "projection",
+            "log_barrier_kappa": 0.0,
             "admm": {
                 "sigma": 1e-6,
                 "max_iter": 1,
@@ -83,7 +88,7 @@ def _build_qp(horizon: int):
         backward_backend=BackwardBackend.ADMM_JAX_LOOP_PCG,
     )
     guess = solver.initial_guess(params)
-    return solver._build_qp_data(guess.states, guess.controls, params)
+    return build_gauss_newton_qp(solver, guess.states, guess.controls, params)
 
 
 def _zero_state(qp, rho_bar, batched_Nb=None):
@@ -134,13 +139,29 @@ def _broadcast_qp(qp, Nb):
             G=tile(qp.ineq.G),
             l=tile(qp.ineq.l),
             u=tile(qp.ineq.u),
-            slack_penalization_weight=qp.ineq.slack_penalization_weight,
-            use_slack_variables=qp.ineq.use_slack_variables,
+            slack_penalization_weight=tile(qp.ineq.slack_penalization_weight),
         ),
     )
 
 
-def _solve(qp, rho_bar, *, max_iter, check_every, adapt_rho_every, eps=1e-4):
+def _handling_kw(constraint_handling, log_barrier_kappa):
+    return dict(
+        constraint_handling=int(constraint_handling),
+        log_barrier_kappa=log_barrier_kappa,
+    )
+
+
+def _solve(
+    qp,
+    rho_bar,
+    *,
+    max_iter,
+    check_termination_every,
+    adapt_rho_every,
+    eps=1e-4,
+    constraint_handling=ConstraintHandling.PROJECTION,
+    log_barrier_kappa=0.0,
+):
     backend = _admm_cudss_backend()
     schur = compute_S_Phiinv(
         qp,
@@ -149,12 +170,14 @@ def _solve(qp, rho_bar, *, max_iter, check_every, adapt_rho_every, eps=1e-4):
         rho_ineq=jnp.asarray(rho_bar, dtype=qp.cost.q.dtype),
     )
     state0 = _zero_state(qp, rho_bar)
-    return backend.admm_cudss_ffi_solve_single(
+    workspace = backend.AdmmCudssWorkspace()
+    return backend.admm_cudss_ffi_solve(
         qp,
         schur,
         state0,
+        workspace=workspace,
         max_iter=max_iter,
-        check_every=check_every,
+        check_termination_every=check_termination_every,
         adapt_rho_every=adapt_rho_every,
         eps_abs=eps,
         eps_rel=eps,
@@ -162,17 +185,65 @@ def _solve(qp, rho_bar, *, max_iter, check_every, adapt_rho_every, eps=1e-4):
         rho_min=1e-6,
         rho_max=1e6,
         **_BASE_KW,
+        **_handling_kw(constraint_handling, log_barrier_kappa),
     )
 
 
-def _cache_size() -> int:
-    fn = _admm_cudss_backend()._LIB.ADMMCudssCacheSize
-    fn.restype = ctypes.c_int
-    return int(fn())
+@pytest.mark.parametrize(("constraint_handling", "log_barrier_kappa"), HANDLINGS)
+@pytest.mark.parametrize("batch_shape", [(1,), (2,), (2, 1)])
+def test_solve_custom_vmap_batches_into_one_workspace(
+    batch_shape, constraint_handling, log_barrier_kappa
+):
+    backend = _admm_cudss_backend()
+    qp = _build_qp(horizon=8)
+    rho_bar = 0.1
+    schur = compute_S_Phiinv(
+        qp,
+        jnp.asarray(rho_bar * _BASE_KW["rho_f_factor"], dtype=qp.cost.q.dtype),
+        jnp.asarray(_BASE_KW["sigma"], dtype=qp.cost.q.dtype),
+        rho_ineq=jnp.asarray(rho_bar, dtype=qp.cost.q.dtype),
+    )
+    state0 = _zero_state(qp, rho_bar)
+    workspace = backend.AdmmCudssWorkspace()
 
+    def solve_one(state):
+        return backend.admm_cudss_ffi_solve(
+            qp,
+            schur,
+            state,
+            workspace=workspace,
+            max_iter=2,
+            check_termination_every=0,
+            **_BASE_KW,
+            **_handling_kw(constraint_handling, log_barrier_kappa),
+        )
 
-def _clear_cache() -> None:
-    _admm_cudss_backend()._LIB.ClearADMMCudssCacheImpl()
+    expected = solve_one(state0)
+    jax.block_until_ready(expected)
+    workspace_handle = workspace.handle
+    batched_state = jax.tree.map(
+        lambda value: jnp.broadcast_to(value, batch_shape + value.shape), state0
+    )
+    solve_batched = solve_one
+    for _ in batch_shape:
+        solve_batched = jax.vmap(solve_batched)
+    actual = jax.jit(solve_batched)(batched_state)
+    jax.block_until_ready(actual)
+
+    expected_x = jnp.broadcast_to(
+        expected.state.x_blocks, batch_shape + expected.state.x_blocks.shape
+    )
+    np.testing.assert_allclose(actual.state.x_blocks, expected_x, atol=1e-12)
+    assert actual.stats.num_iter.shape == batch_shape
+
+    # Changing back to a scalar call may resize native capacity, but the stable
+    # handle owned by the solver must remain valid and unchanged.
+    actual_scalar = solve_one(state0)
+    jax.block_until_ready(actual_scalar)
+    assert workspace.handle == workspace_handle
+    np.testing.assert_allclose(
+        actual_scalar.state.x_blocks, expected.state.x_blocks, atol=1e-12
+    )
 
 
 def test_adapt_rho_disabled_is_identical_to_fixed():
@@ -180,11 +251,13 @@ def test_adapt_rho_disabled_is_identical_to_fixed():
     qp = _build_qp(horizon=20)
     rho_bar = 0.1
 
-    a = _solve(qp, rho_bar, max_iter=200, check_every=5, adapt_rho_every=0)
-    b = _solve(qp, rho_bar, max_iter=200, check_every=5, adapt_rho_every=0)
+    a = _solve(qp, rho_bar, max_iter=200, check_termination_every=5, adapt_rho_every=0)
+    b = _solve(qp, rho_bar, max_iter=200, check_termination_every=5, adapt_rho_every=0)
 
-    np.testing.assert_allclose(np.asarray(a.x_out), np.asarray(b.x_out), atol=1e-12)
-    assert int(a.iters_out) == int(b.iters_out)
+    np.testing.assert_allclose(
+        np.asarray(a.state.x_blocks), np.asarray(b.state.x_blocks), atol=1e-12
+    )
+    assert int(a.stats.num_iter) == int(b.stats.num_iter)
     np.testing.assert_allclose(
         np.asarray(a.state.rho_bar), np.asarray(b.state.rho_bar), atol=1e-12
     )
@@ -194,8 +267,12 @@ def test_adapt_rho_actually_updates_rho():
     qp = _build_qp(horizon=20)
     rho_bar_init = 1e-4  # tiny → primal residuals dominate, rho must grow
 
-    fixed = _solve(qp, rho_bar_init, max_iter=200, check_every=5, adapt_rho_every=0)
-    adapt = _solve(qp, rho_bar_init, max_iter=200, check_every=5, adapt_rho_every=10)
+    fixed = _solve(
+        qp, rho_bar_init, max_iter=200, check_termination_every=5, adapt_rho_every=0
+    )
+    adapt = _solve(
+        qp, rho_bar_init, max_iter=200, check_termination_every=5, adapt_rho_every=10
+    )
 
     rho_fixed = float(fixed.state.rho_bar)
     rho_adapt = float(adapt.state.rho_bar)
@@ -210,21 +287,27 @@ def test_adapt_rho_actually_updates_rho():
     )
 
 
-def test_adapt_rho_speeds_up_convergence_when_misturned():
+@pytest.mark.parametrize(("constraint_handling", "log_barrier_kappa"), HANDLINGS)
+def test_adapt_rho_speeds_up_convergence_when_misturned(
+    constraint_handling, log_barrier_kappa
+):
     # Empirical: fixed ~1150 iters, adaptive ~20. eps≤1e-4 required —
     # at 1e-3 fixed-rho can pass tolerance while still ~7% off the minimum.
     qp = _build_qp(horizon=20)
     rho_bar_init = 1e-3  # well-tuned is ~0.1 here
-
-    fixed = _solve(
-        qp, rho_bar_init, max_iter=2000, check_every=5, adapt_rho_every=0, eps=1e-4
+    kw = dict(
+        max_iter=2000,
+        check_termination_every=5,
+        eps=1e-4,
+        constraint_handling=constraint_handling,
+        log_barrier_kappa=log_barrier_kappa,
     )
-    adapt = _solve(
-        qp, rho_bar_init, max_iter=2000, check_every=5, adapt_rho_every=10, eps=1e-4
-    )
 
-    iters_fixed = int(fixed.iters_out)
-    iters_adapt = int(adapt.iters_out)
+    fixed = _solve(qp, rho_bar_init, adapt_rho_every=0, **kw)
+    adapt = _solve(qp, rho_bar_init, adapt_rho_every=10, **kw)
+
+    iters_fixed = int(fixed.stats.num_iter)
+    iters_adapt = int(adapt.stats.num_iter)
     assert iters_fixed < 2000, f"fixed-rho path did not converge: {iters_fixed} iters"
     assert iters_adapt < 2000, f"adapt-rho path did not converge: {iters_adapt} iters"
 
@@ -233,14 +316,14 @@ def test_adapt_rho_speeds_up_convergence_when_misturned():
         f"adaptive={iters_adapt}"
     )
 
-    diff = float(jnp.max(jnp.abs(fixed.x_out - adapt.x_out)))
-    norm = float(jnp.max(jnp.abs(fixed.x_out)))
+    diff = float(jnp.max(jnp.abs(fixed.state.x_blocks - adapt.state.x_blocks)))
+    norm = float(jnp.max(jnp.abs(fixed.state.x_blocks)))
     rel = diff / max(norm, 1e-30)
     assert rel < 5e-3, f"fixed and adaptive solutions disagree: rel diff = {rel:.3e}"
 
 
-@pytest.mark.parametrize("check_every", [5, 10, 25])
-def test_iters_out_matches_buffer_state(check_every):
+@pytest.mark.parametrize("check_termination_every", [5, 10, 25])
+def test_iters_out_matches_buffer_state(check_termination_every):
     backend = _admm_cudss_backend()
     qp = _build_qp(horizon=30)
     rho_bar = 0.1
@@ -251,40 +334,44 @@ def test_iters_out_matches_buffer_state(check_every):
         rho_ineq=jnp.asarray(rho_bar, dtype=qp.cost.q.dtype),
     )
     state0 = _zero_state(qp, rho_bar)
+    workspace = backend.AdmmCudssWorkspace()
 
-    solved = backend.admm_cudss_ffi_solve_single(
+    solved = backend.admm_cudss_ffi_solve(
         qp,
         schur,
         state0,
+        workspace=workspace,
         max_iter=200,
-        check_every=check_every,
+        check_termination_every=check_termination_every,
         eps_abs=1e-4,
         eps_rel=1e-3,
         **_BASE_KW,
     )
-    K = int(solved.iters_out)
+    K = int(solved.stats.num_iter)
     assert K < 200, "test problem should converge within max_iter"
 
-    oracle = backend.admm_cudss_ffi_solve_single(
+    oracle = backend.admm_cudss_ffi_solve(
         qp,
         schur,
         state0,
+        workspace=workspace,
         max_iter=K,
-        check_every=0,
+        check_termination_every=0,
         eps_abs=1e-30,
         eps_rel=1e-30,
         **_BASE_KW,
     )
 
-    diff_x = float(jnp.max(jnp.abs(solved.x_out - oracle.x_out)))
+    diff_x = float(jnp.max(jnp.abs(solved.state.x_blocks - oracle.state.x_blocks)))
     diff_z = float(jnp.max(jnp.abs(solved.state.z_g - oracle.state.z_g)))
     diff_y = float(jnp.max(jnp.abs(solved.state.y_g - oracle.state.y_g)))
 
-    norm_x = float(jnp.max(jnp.abs(oracle.x_out)))
+    norm_x = float(jnp.max(jnp.abs(oracle.state.x_blocks)))
     rel = diff_x / max(norm_x, 1e-30)
 
     assert rel < 1e-4, (
-        f"check_every={check_every}: solved.x_out is not the iter-{K} state "
+        f"check_termination_every={check_termination_every}: "
+        f"solved state is not the iter-{K} state "
         f"(rel {rel:.3e}, abs {diff_x:.3e}; z_g {diff_z:.3e}; y_g {diff_y:.3e})"
     )
 
@@ -300,7 +387,7 @@ def test_batched_rho_applied_per_element(rhos):
 
     kw_no_conv = dict(
         max_iter=20,
-        check_every=0,
+        check_termination_every=0,
         eps_abs=1e-30,
         eps_rel=1e-30,
         **_BASE_KW,
@@ -314,14 +401,17 @@ def test_batched_rho_applied_per_element(rhos):
             rho_ineq=jnp.asarray(rho, dtype=dtype),
         )
         state0 = _zero_state(qp, rho)
-        return backend.admm_cudss_ffi_solve_single(qp, schur, state0, **kw_no_conv)
+        workspace = backend.AdmmCudssWorkspace()
+        return backend.admm_cudss_ffi_solve(
+            qp, schur, state0, workspace=workspace, **kw_no_conv
+        )
 
     r_a = run_single(rho_a)
     r_b = run_single(rho_b)
 
-    diff_per_rho = float(jnp.max(jnp.abs(r_a.x_out - r_b.x_out)))
+    diff_per_rho = float(jnp.max(jnp.abs(r_a.state.x_blocks - r_b.state.x_blocks)))
     assert diff_per_rho > 1e-4, (
-        "test problem is degenerate: x_out is rho-invariant (||x_a -"
+        "test problem is degenerate: x_blocks is rho-invariant (||x_a -"
         f" x_b||={diff_per_rho:.2e})"
     )
 
@@ -342,11 +432,15 @@ def test_batched_rho_applied_per_element(rhos):
     state0_batched = _zero_state(qp, rhos_arr, batched_Nb=2)
 
     r_batched = backend.admm_cudss_ffi_solve(
-        qp_batched, schur_batched, state0_batched, **kw_no_conv
+        qp_batched,
+        schur_batched,
+        state0_batched,
+        workspace=backend.AdmmCudssWorkspace(),
+        **kw_no_conv,
     )
 
-    diff_0 = float(jnp.max(jnp.abs(r_batched.x_out[0] - r_a.x_out)))
-    diff_1 = float(jnp.max(jnp.abs(r_batched.x_out[1] - r_b.x_out)))
+    diff_0 = float(jnp.max(jnp.abs(r_batched.state.x_blocks[0] - r_a.state.x_blocks)))
+    diff_1 = float(jnp.max(jnp.abs(r_batched.state.x_blocks[1] - r_b.state.x_blocks)))
 
     tol = 1e-5
     assert (
@@ -412,26 +506,6 @@ def test_all_cudss_calls_are_status_checked():
     )
 
 
-def test_clear_cache_releases_cuDSS_entries():
-    _clear_cache()  # other tests may have populated entries
-    assert _cache_size() == 0, "clear_cache did not empty the map at test entry"
-
-    horizons = [12, 24, 36]
-    for T in horizons:
-        qp = _build_qp(horizon=T)
-        out = _solve(qp, 0.1, max_iter=5, check_every=5, adapt_rho_every=0)
-        out.x_out.block_until_ready()
-
-    populated = _cache_size()
-    assert populated == len(horizons), (
-        f"expected {len(horizons)} cache entries after solves at "
-        f"{horizons}, got {populated}"
-    )
-
-    _clear_cache()
-    assert _cache_size() == 0, "clear_cache failed to remove entries"
-
-
 def test_no_rho_update_on_converged_iteration():
     backend = _admm_cudss_backend()
     # eps=1e10 forces convergence on iter 1; mis-tuned rho + tight gate forces
@@ -446,13 +520,15 @@ def test_no_rho_update_on_converged_iteration():
         rho_ineq=jnp.asarray(rho_bar, dtype=qp.cost.q.dtype),
     )
     state0 = _zero_state(qp, rho_bar)
+    workspace = backend.AdmmCudssWorkspace()
 
-    out = backend.admm_cudss_ffi_solve_single(
+    out = backend.admm_cudss_ffi_solve(
         qp,
         schur,
         state0,
+        workspace=workspace,
         max_iter=10,
-        check_every=1,
+        check_termination_every=1,
         adapt_rho_every=1,
         eps_abs=1e10,
         eps_rel=1e10,
@@ -462,7 +538,7 @@ def test_no_rho_update_on_converged_iteration():
         **_BASE_KW,
     )
 
-    iters = int(out.iters_out)
+    iters = int(out.stats.num_iter)
     assert (
         1 <= iters <= 5
     ), f"expected near-immediate convergence (iters in [1,5]); got iters={iters}"

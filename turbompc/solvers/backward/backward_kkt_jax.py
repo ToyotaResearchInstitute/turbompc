@@ -3,6 +3,7 @@
 from typing import Tuple
 
 import jax.numpy as jnp
+
 from turbompc.solvers.qp_data import QPData
 from turbompc.solvers.qp_utils import ZShape, unpack_x
 

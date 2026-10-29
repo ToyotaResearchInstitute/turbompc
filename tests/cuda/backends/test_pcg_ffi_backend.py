@@ -3,6 +3,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+
 from tests.helpers.backend_utils import backend_available
 from tests.helpers.problem_fixtures import make_spacecraft_params
 from tests.helpers.schur_fixtures import make_spacecraft_schur_system
@@ -25,6 +26,46 @@ from turbompc.solvers.turbompc_solver import (
     not backend_available(SchurSolverBackend.PCG_FFI), reason="PCG FFI not built"
 )
 class TestPcgFfiBackend:
+    @pytest.mark.parametrize("batch_shape", [(1,), (2,), (2, 1)])
+    def test_custom_vmap_flattens_nested_batches(self, batch_shape):
+        from turbompc.solvers.linear_systems_solvers.pcg_ffi_backend import (
+            pcg_ffi_solve,
+        )
+
+        schur, rhs = make_spacecraft_schur_system(horizon=5)
+        x0 = jnp.zeros_like(rhs)
+        expected, expected_iterations = pcg_ffi_solve(
+            schur.S,
+            schur.preconditioner_Phiinv,
+            rhs,
+            x0,
+            eps=1e-12,
+            max_iters=500,
+        )
+        args = (schur.S, schur.preconditioner_Phiinv, rhs, x0)
+        batched_args = jax.tree.map(
+            lambda value: jnp.broadcast_to(value, batch_shape + value.shape),
+            args,
+        )
+
+        def solve_batched(*values):
+            return pcg_ffi_solve(*values, eps=1e-12, max_iters=500)
+
+        for _ in batch_shape:
+            solve_batched = jax.vmap(solve_batched)
+        actual, actual_iterations = jax.jit(solve_batched)(*batched_args)
+        jax.block_until_ready(actual)
+
+        np.testing.assert_allclose(
+            actual,
+            jnp.broadcast_to(expected, batch_shape + expected.shape),
+            rtol=1e-5,
+        )
+        np.testing.assert_array_equal(
+            actual_iterations,
+            jnp.broadcast_to(expected_iterations, batch_shape),
+        )
+
     @pytest.mark.parametrize("horizon", [5, 20])
     def test_pcg_ffi_vs_scipy(self, horizon):
         """PCG FFI solution matches a direct `jnp.linalg.solve` reference."""

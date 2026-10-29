@@ -10,6 +10,7 @@ from typing import Union
 
 import jax
 import jax.numpy as jnp
+
 from turbompc.solvers.linear_systems_solvers.backends import SchurSolverBackend
 
 ArrayLike = Union[jax.Array, jnp.ndarray]
@@ -44,7 +45,8 @@ def block_tridi_apply(schur_blocks: ArrayLike, x_blocks: ArrayLike) -> jax.Array
     x_prev = jnp.concatenate([jnp.zeros((1, n), dtype=x.dtype), x[:-1]], axis=0)
     x_next = jnp.concatenate([x[1:], jnp.zeros((1, n), dtype=x.dtype)], axis=0)
     x_stack = jnp.concatenate([x_prev, x, x_next], axis=-1)  # (T, 3n)
-    return jnp.einsum("tij,tj->ti", S, x_stack)
+    # einsum("tij,tj->ti", S, x_stack)
+    return (S @ x_stack[..., None])[..., 0]
 
 
 def block_tridi_to_dense(schur_blocks: ArrayLike) -> jax.Array:

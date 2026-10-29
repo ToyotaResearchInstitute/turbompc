@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple
 
 import jax.numpy as jnp
+from jax import vmap
+
 from turbompc.solvers.linear_systems_solvers.backends import SchurSolverBackend
 from turbompc.solvers.linear_systems_solvers.linear_solve import (
     solve_block_tridi_system,
@@ -27,7 +29,34 @@ class SchurSystemSolver:
     backend: SchurSolverBackend
     name: str
 
+    @property
+    def requires_preconditioner(self) -> bool:
+        return self.backend in {
+            SchurSolverBackend.PCG,
+            SchurSolverBackend.PCG_FFI,
+        }
+
     def solve(
+        self,
+        schur: SchurComplementMatrices,
+        gammas: jnp.ndarray,
+        zs_guess: jnp.ndarray,
+        *,
+        factorize=True,
+    ) -> Tuple[jnp.ndarray, PCGDebugOutput]:
+        """Solve one or a batch of Schur systems.
+
+        ``schur.S`` has shape ``(T, nz, 3*nz)`` or ``(B, T, nz, 3*nz)``.
+        ``gammas`` and ``zs_guess`` have shape ``(T, nz)`` or ``(B, T, nz)``.
+        """
+        del factorize
+        if schur.S.ndim == 3:
+            return self._solve_single(schur, gammas, zs_guess)
+        if schur.S.ndim == 4:
+            return vmap(self._solve_single)(schur, gammas, zs_guess)
+        raise ValueError("Schur blocks must have rank 3 or 4")
+
+    def _solve_single(
         self,
         schur: SchurComplementMatrices,
         gammas: jnp.ndarray,
@@ -42,7 +71,7 @@ class PcgIterativeSchurSolver(SchurSystemSolver):
 
     _pcg: PCGPrimalOptimalControl
 
-    def solve(self, schur, gammas, zs_guess):
+    def _solve_single(self, schur, gammas, zs_guess):
         return self._pcg.solve_linear_system(schur, gammas, zs_guess)
 
 
@@ -52,7 +81,7 @@ class PcgFfiSchurSolver(SchurSystemSolver):
 
     pcg_params: Dict[str, Any]
 
-    def solve(self, schur, gammas, zs_guess):
+    def _solve_single(self, schur, gammas, zs_guess):
         from turbompc.solvers.linear_systems_solvers.pcg_ffi_backend import (
             pcg_ffi_solve,
         )
@@ -71,25 +100,86 @@ class PcgFfiSchurSolver(SchurSystemSolver):
 class CudssFfiSchurSolver(SchurSystemSolver):
     """CUDA FFI direct solve (cuDSS)."""
 
-    def solve(self, schur, gammas, zs_guess):
+    _workspace: Any = field(default=None, init=False, repr=False, compare=False)
+
+    def solve(self, schur, gammas, zs_guess, *, factorize=True):
         from turbompc.solvers.linear_systems_solvers.cudss_ffi_backend import (
-            cudss_ffi_solve,
+            CudssBlockTridiWorkspace,
         )
 
-        sol = cudss_ffi_solve(schur.S, gammas)
-        return sol, PCGDebugOutput(num_iterations=jnp.array(0), convergence_eta=0.0)
+        del zs_guess
+        batch_size = 1 if schur.S.ndim == 3 else schur.S.shape[0]
+        workspace = self._workspace
+        if workspace is None:
+            workspace = CudssBlockTridiWorkspace()
+            object.__setattr__(self, "_workspace", workspace)
+        sol = workspace.solve(schur.S, gammas, factorize=factorize)
+        debug_shape = () if batch_size == 1 else (batch_size,)
+        return sol, PCGDebugOutput(
+            num_iterations=jnp.zeros(debug_shape, dtype=jnp.int32),
+            convergence_eta=0.0,
+        )
+
+    def close(self) -> None:
+        workspace = self._workspace
+        object.__setattr__(self, "_workspace", None)
+        if workspace is not None:
+            workspace.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 @dataclass(frozen=True)
 class JaxDenseSchurSolver(SchurSystemSolver):
     """Dense direct solve using `jnp.linalg.solve`."""
 
-    def solve(self, schur, gammas, zs_guess):
+    def _solve_single(self, schur, gammas, zs_guess):
         zs = solve_block_tridi_system(
             schur.S, gammas, backend=SchurSolverBackend.JAX_DENSE
         )
         zs = jnp.asarray(zs)
         return zs, PCGDebugOutput(num_iterations=jnp.array(0), convergence_eta=0.0)
+
+
+@dataclass(frozen=True)
+class EigenSchurSolver(SchurSystemSolver):
+    """Direct solve using Eigen block LDLT factorization."""
+
+    _workspace: Any = field(default=None, init=False, repr=False, compare=False)
+
+    def solve(self, schur, gammas, zs_guess, *, factorize=True):
+        from turbompc.solvers.linear_systems_solvers.eigen_backend import (
+            EigenBlockTridiWorkspace,
+        )
+
+        del zs_guess
+        batch_size = 1 if schur.S.ndim == 3 else schur.S.shape[0]
+        workspace = self._workspace
+        if workspace is None:
+            workspace = EigenBlockTridiWorkspace()
+            object.__setattr__(self, "_workspace", workspace)
+        zs = workspace.solve(schur.S, gammas, factorize=factorize)
+        debug_shape = () if batch_size == 1 else (batch_size,)
+        zeros = jnp.zeros(debug_shape, dtype=jnp.int32)
+        return zs, PCGDebugOutput(num_iterations=zeros, convergence_eta=0.0)
+
+    def close(self) -> None:
+        """Release the native Eigen workspace owned by this solver."""
+        workspace = self._workspace
+        object.__setattr__(self, "_workspace", None)
+        if workspace is not None:
+            workspace.close()
+
+    def __del__(self) -> None:
+        """Release owned Eigen resources when Python destroys this solver."""
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def make_schur_solver(
@@ -139,5 +229,13 @@ def make_schur_solver(
             num_controls=num_controls,
             backend=backend,
             name="JaxDenseSchurSolver",
+        )
+    if backend == SchurSolverBackend.EIGEN:
+        return EigenSchurSolver(
+            horizon=horizon,
+            num_states=num_states,
+            num_controls=num_controls,
+            backend=backend,
+            name="EigenSchurSolver",
         )
     raise ValueError(f"Unsupported Schur solver backend: {backend}")

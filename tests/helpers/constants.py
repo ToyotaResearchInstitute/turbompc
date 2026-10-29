@@ -5,6 +5,7 @@ ADMM_EPS_BY_BACKEND = {
     SchurSolverBackend.PCG: 1.0e-10,
     SchurSolverBackend.PCG_FFI: 1.0e-7,
     SchurSolverBackend.CUDSS_FFI: 1.0e-10,
+    SchurSolverBackend.EIGEN: 1.0e-10,
 }
 
 # Forward-backend-level tolerances (fused kernels use their own convergence)
@@ -13,6 +14,7 @@ ADMM_EPS_BY_FORWARD_BACKEND = {
     ForwardBackend.ADMM_JAX_LOOP_PCG_FFI: 1.0e-6,
     ForwardBackend.ADMM_JAX_LOOP_CUDSS_FFI: 1.0e-10,
     ForwardBackend.ADMM_JAX_LOOP_JAX_DENSE: 1.0e-10,
+    ForwardBackend.ADMM_JAX_LOOP_EIGEN: 1.0e-10,
     ForwardBackend.ADMM_FUSED_PCG: 1.0e-4,
     ForwardBackend.ADMM_FUSED_CUDSS: 1.0e-4,
 }

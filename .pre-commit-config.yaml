@@ -32,7 +32,7 @@ repos:
           "--max-complexity", "18",
           "--select", "B,C,E,F,W,T4,B9",
           "--per-file-ignores",
-          "turbompc/solvers/qp_data.py:E741 turbompc/solvers/turbompc_solver.py:E741, turbompc/solvers/sqp_osqp.py:E741 turbompc/problems/optimal_control_problem.py:E741 tests/python/solvers/test_solver_sqp_osqp.py:E741 tests/python/solvers/test_admm_residuals.py:E741 tests/cuda/solvers/test_turbompc_solver_backends.py:E741,benchmarking/linear-system/benchmark_mpcpytorch_constrained.py:F821,benchmarking/linear-system/benchmark_mpcpytorch_constrained.py:C901",
+          "turbompc/solvers/qp_data.py:E741 turbompc/solvers/turbompc_solver.py:E741, turbompc/solvers/constraint_handling/*.py:E741,turbompc/solvers/sqp_osqp.py:E741 turbompc/problems/optimal_control_problem.py:E741 tests/python/solvers/test_solver_sqp_osqp.py:E741 tests/python/solvers/test_admm_residuals.py:E741 tests/cuda/solvers/test_turbompc_solver_backends.py:E741,benchmarking/linear_system/benchmark_mpcpytorch_constrained.py:F821,benchmarking/linear_system/benchmark_mpcpytorch_constrained.py:C901,benchmarking/linear_system/benchmark_acados_gradient_accuracy.py:F821,benchmarking/linear_system/benchmark_turbompc_gradient_accuracy.py:F821",
       ]
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: 'v0.1.8'
@@ -42,5 +42,5 @@ repos:
           "--fix",
           "--ignore", "E402",
           "--per-file-ignores",
-          "turbompc/solvers/qp_data.py:E741,turbompc/solvers/turbompc_solver.py:E741,turbompc/solvers/sqp_osqp.py:E741,turbompc/problems/optimal_control_problem.py:E741,tests/python/solvers/test_solver_sqp_osqp.py:E741,tests/python/solvers/test_admm_residuals.py:E741,tests/cuda/solvers/test_turbompc_solver_backends.py:E741,benchmarking/linear-system/benchmark_mpcpytorch_constrained.py:F821",
+          "turbompc/solvers/qp_data.py:E741,turbompc/solvers/turbompc_solver.py:E741,turbompc/solvers/constraint_handling/*.py:E741,turbompc/solvers/sqp_osqp.py:E741,turbompc/problems/optimal_control_problem.py:E741,tests/python/solvers/test_solver_sqp_osqp.py:E741,tests/python/solvers/test_admm_residuals.py:E741,tests/cuda/solvers/test_turbompc_solver_backends.py:E741,benchmarking/linear_system/benchmark_mpcpytorch_constrained.py:F821,benchmarking/linear_system/benchmark_acados_gradient_accuracy.py:F821,benchmarking/linear_system/benchmark_turbompc_gradient_accuracy.py:F821",
         ]

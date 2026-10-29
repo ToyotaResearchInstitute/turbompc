@@ -1,8 +1,4 @@
-"""Drone obstacle-avoidance utilities for the tutorial notebook.
-
-Consolidates the constants, problem/solver configuration, and closed-loop
-rollout helper that were previously spread across three separate scripts.
-"""
+"""Drone obstacle-avoidance utilities for the tutorial notebook."""
 
 from __future__ import annotations
 
@@ -29,16 +25,15 @@ _JAX_CACHE = os.environ.get(
 config.update("jax_compilation_cache_dir", _JAX_CACHE)
 
 import jax.numpy as jnp  # noqa: E402
+
 from turbompc.dynamics.drone_dynamics import (
     DroneDynamics,
     drone_parameters,
     drone_state_dot_parameters,
 )
 from turbompc.dynamics.integrators import DiscretizationScheme, predict_next_state
-from turbompc.problems.obstacle_avoidance import (
-    OptimalControlProblemObstacle,
-    OptimalControlProblemObstacleSlack,
-)
+from turbompc.problems.obstacle_avoidance import OptimalControlProblemObstacle
+from turbompc.solvers.status import SQPStatus
 from turbompc.solvers.turbompc_solver import (
     BackwardBackend,
     ForwardBackend,
@@ -140,8 +135,8 @@ def _make_solver_params(
     sp["num_sqp_iteration_max"] = sqp_iter
     sp["tol_convergence"] = sqp_tol
     sp["warm_start_backward"] = warm_start
-    sp["linesearch"] = True
-    sp["linesearch_alphas"] = [0.1, 0.3, 0.7, 1.0]
+    sp["linesearch"]["method"] = "merit"
+    sp["linesearch"]["alphas"] = [0.1, 0.3, 0.7, 1.0]
     sp["admm"]["max_iter"] = admm_max_iter
     sp["admm"]["check_termination_every"] = 5
     sp["admm"]["eps_abs"] = admm_tol
@@ -190,14 +185,9 @@ def make_drone_config(
         obs_centers = _DEFAULT_OBS_CENTERS
     if obs_radii is None:
         obs_radii = _DEFAULT_OBS_RADII
-    problem_class = (
-        OptimalControlProblemObstacleSlack
-        if use_slack
-        else OptimalControlProblemObstacle
-    )
     return ProblemConfig(
         dynamics=DroneDynamics(drone_parameters),
-        problem_class=problem_class,
+        problem_class=OptimalControlProblemObstacle,
         problem_params=_make_problem_params(
             use_slack,
             slack_weight,
@@ -318,6 +308,7 @@ def collect_turbompc_drone_trajectory(
     traj = [np.array(state)]
     u_log = []
     sqp_iters_per_step = [int(solution.num_iter)]
+    sqp_statuses = [int(solution.status)]
     total_cost = 0.0
 
     for _ in range(sim_steps):
@@ -352,6 +343,7 @@ def collect_turbompc_drone_trajectory(
         traj.append(np.array(state))
         u_log.append(np.array(u0))
         sqp_iters_per_step.append(int(solution.num_iter))
+        sqp_statuses.append(int(solution.status))
 
     traj_arr = np.array(traj)
     u_arr = np.array(u_log)
@@ -366,6 +358,9 @@ def collect_turbompc_drone_trajectory(
     n_violations = int(np.sum(violated))
     terminal_err = float(np.linalg.norm(traj_arr[-1]))
     max_sqp = solver_params["num_sqp_iteration_max"]
+    accepted_statuses = {SQPStatus.SOLVED}
+    if max_sqp == 1:
+        accepted_statuses.add(SQPStatus.MAX_ITER)
 
     metrics = {
         "solver": "turbompc",
@@ -380,7 +375,10 @@ def collect_turbompc_drone_trajectory(
         "mean_delta_u": mean_delta_u,
         "obs_margins": all_margins.tolist(),
         "sqp_iters_per_step": sqp_iters_per_step,
-        "failure_count": sum(i >= max_sqp for i in sqp_iters_per_step),
+        "sqp_statuses": sqp_statuses,
+        "failure_count": sum(
+            status not in accepted_statuses for status in sqp_statuses
+        ),
         "cost": total_cost,
     }
     return traj_arr, metrics, u_arr

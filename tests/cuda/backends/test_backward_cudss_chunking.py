@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+
 from tests.helpers.backend_utils import backend_available
 from turbompc.solvers.turbompc_solver import BackwardBackend
 
@@ -54,7 +55,10 @@ def _build_backward_qp(nx, nu, H, *, m_g=0, seed=0):
         cost=QPCostBlocks(D=D, E=E, q=q),
         eq=QPEqualityBlocks(A0=A0, A_minus=A_minus, A_plus=A_plus, c0=c0, c=c),
         ineq=QPInequalityBlocks(
-            G=G, l=jnp.zeros((N + 1, m_g)), u=jnp.zeros((N + 1, m_g))
+            G=G,
+            l=jnp.zeros((N + 1, m_g)),
+            u=jnp.zeros((N + 1, m_g)),
+            slack_penalization_weight=jnp.asarray(0.0),
         ),
     )
     return qp, ZShape(horizon=N, num_states=nx, num_controls=nu)
@@ -95,8 +99,9 @@ def _max_rel(a, b):
 
 def _run(qp, zshape, in_axes):
     bk = _backward_cudss_module()
+    solver = bk.CudssBackwardKktSolver()
     fn = jax.jit(
-        jax.vmap(bk.solve_backward_kkt_cudss_ffi, in_axes=(in_axes, None)),
+        jax.vmap(solver.solve, in_axes=(in_axes, None)),
         static_argnums=1,
     )
     (x, y), m = fn(qp, zshape)
@@ -157,7 +162,7 @@ def test_backward_chunking_is_numerically_exact():
             G=bc(qp0.ineq.G),
             l=bc(qp0.ineq.l),
             u=bc(qp0.ineq.u),
-            slack_penalization_weight=jnp.zeros((Nb,)),
+            slack_penalization_weight=bc(qp0.ineq.slack_penalization_weight),
         ),
     )
     all_b = jax.tree.map(lambda _: 0, qp)
@@ -198,10 +203,9 @@ def test_chunk_loop_compiles_in_constant_time():
     try:
         bk._safe_cudss_chunk = lambda *a, **k: 1  # 48 chunks
         t0 = time.time()
+        solver = bk.CudssBackwardKktSolver()
         fn = jax.jit(
-            jax.vmap(
-                bk.solve_backward_kkt_cudss_ffi, in_axes=(_COST_ONLY_IN_AXES, None)
-            ),
+            jax.vmap(solver.solve, in_axes=(_COST_ONLY_IN_AXES, None)),
             static_argnums=1,
         )
         (x, _), _ = fn(qp, zshape)
@@ -214,11 +218,10 @@ def test_chunk_loop_compiles_in_constant_time():
 
 
 def test_singular_solve_raises_not_aborts():
-    """A cuDSS failure must surface as a CATCHABLE Python exception, not
+    """A native FFI failure must surface as a CATCHABLE Python exception, not
     abort() the process.
 
-    Subprocess-isolated: forcing a cuDSS error can leave the CUDA context
-    unusable, so we run the failing solve in a disposable child. Pre-fix
+    Subprocess-isolated so a regression cannot terminate the test runner. Pre-fix
     the child dies via abort() inside CUDSS_CHECK (no "CAUGHT", non-zero
     rc); post-fix the child catches a Python exception and exits 0.
     """
@@ -238,28 +241,25 @@ def test_singular_solve_raises_not_aborts():
         import turbompc.solvers.backward.backward_kkt_cudss_ffi as bk
         # Confirm we loaded the worktree copy (fail loudly otherwise).
         assert "%s" in bk.__file__, "child imported wrong turbompc: " + bk.__file__
-        rp, ci, pat = bk._get_or_build_pattern(4, 4, 2, 2, 0)
-        n = int(pat.N_kkt)
-        rp_bad = rp.at[-1].set(int(pat.nnz) + 100)   # inconsistent CSR -> cuDSS error
-        vals = jnp.ones((int(pat.nnz),), jnp.float64)
-        rhs = jnp.ones((n,), jnp.float64)
+        import types
+        pat = bk.build_kkt_csr_pattern(4, 4, 2, 2, 0)
+        workspace = bk.CudssSparseKktWorkspace(pat, jnp.float64)
+        stale = types.SimpleNamespace(
+            dtype=workspace.dtype, n=workspace.n, nnz=workspace.nnz,
+            handle=workspace.handle,
+        )
+        workspace.close()
+        vals = jnp.ones((pat.nnz,), jnp.float64)
+        rhs = jnp.ones((pat.N_kkt,), jnp.float64)
         try:
-            out = jax.jit(lambda v, r: bk._call_ffi(rp_bad, ci, v, r, n, jnp.float64))(vals, rhs)
+            out = jax.jit(lambda v, r: bk._call_ffi(v, r, stale))(vals, rhs)
             jax.block_until_ready(out)
-            # os._exit (not sys.exit) bypasses Python interpreter teardown
-            # + atexit; we need it because the forced cuDSS failure corrupted
-            # the CUDA context, and JAX's PJRT buffer destructor (jax >= 0.10)
-            # treats a CUDA error during cleanup as fatal — aborting the child
-            # with SIGABRT after the Python-level catch already succeeded.
-            # `flush=True` is essential before _exit: it skips stdio flushing.
             print("NORAISE", flush=True)
-            import os as _os
-            _os._exit(2)
+            sys.exit(2)
         except Exception as e:
             msg = str(e)
             print("CAUGHT:" + msg[:200], flush=True)
-            import os as _os
-            _os._exit(0 if re.search(r"(?i)cudss|factor|singular|internal", msg) else 3)
+            sys.exit(0 if re.search(r"(?i)cudss|factor|singular|internal", msg) else 3)
         """
         % worktree
     )
@@ -346,24 +346,23 @@ def test_safe_chunk_calibrated_and_cached():
     probe failure ⇒ conservative chunk=1."""
     import turbompc.solvers.backward.backward_kkt_cudss_ffi as _bk
 
-    _bk._SAFE_CHUNK_CACHE.clear()
     saved = _bk._probe_cudss_device_bytes
     calls = []
     try:
+        solver = _bk.CudssBackwardKktSolver()
         _bk._probe_cudss_device_bytes = lambda pat: (
             calls.append(1) or (1_000_000, 800_000_000)
         )
-        c1 = _bk._safe_cudss_chunk(10, 6, 4, 4, 0)
-        c1b = _bk._safe_cudss_chunk(10, 6, 4, 4, 0)  # cached: no 2nd probe
+        c1 = solver.safe_chunk(10, 6, 4, 4, 0)
+        c1b = solver.safe_chunk(10, 6, 4, 4, 0)  # cached: no 2nd probe
         assert c1 == max(1, int(800_000_000 * _bk._CUDSS_BUDGET_SAFETY) // 1_000_000)
         assert c1b == c1
         assert len(calls) == 1, f"probe not cached: {len(calls)} calls"
         _bk._probe_cudss_device_bytes = lambda pat: (0, 0)  # probe failure
-        c_fail = _bk._safe_cudss_chunk(7, 5, 3, 3, 0)
+        c_fail = solver.safe_chunk(7, 5, 3, 3, 0)
         assert c_fail == 1, f"probe failure must fall back to chunk=1, got {c_fail}"
     finally:
         _bk._probe_cudss_device_bytes = saved
-        _bk._SAFE_CHUNK_CACHE.clear()
 
 
 @pytest.mark.extended

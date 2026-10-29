@@ -1,8 +1,10 @@
+import importlib
 import os
 import subprocess
 import sys
 
 import pytest
+
 from turbompc.solvers.linear_systems_solvers.backends import SchurSolverBackend
 from turbompc.solvers.turbompc_solver import BackwardBackend, ForwardBackend
 
@@ -58,6 +60,17 @@ def backend_available(backend) -> bool:
 
 
 def _schur_backend_available(backend: SchurSolverBackend) -> bool:
+    if backend == SchurSolverBackend.EIGEN:
+        key = "eigen"
+        if key not in _AVAIL_CACHE:
+            try:
+                importlib.import_module(
+                    "turbompc.solvers.linear_systems_solvers._eigen_block_tridi"
+                )
+                _AVAIL_CACHE[key] = True
+            except Exception:
+                _AVAIL_CACHE[key] = False
+        return _AVAIL_CACHE[key]
     if backend == SchurSolverBackend.PCG_FFI:
         return _check_ffi_available(
             "\n".join(
@@ -90,7 +103,7 @@ def _schur_backend_available(backend: SchurSolverBackend) -> bool:
                     "import jax; import jax.numpy as jnp",
                     (
                         "from turbompc.solvers.linear_systems_solvers.cudss_ffi_backend"
-                        " import cudss_ffi_solve"
+                        " import CudssBlockTridiWorkspace"
                     ),
                     "T, n = 2, 1",
                     (
@@ -98,7 +111,8 @@ def _schur_backend_available(backend: SchurSolverBackend) -> bool:
                         " dtype=jnp.float32)"
                     ),
                     "rhs = jnp.ones((T, n), dtype=jnp.float32)",
-                    "x = cudss_ffi_solve(S, rhs)",
+                    "workspace = CudssBlockTridiWorkspace()",
+                    "x = workspace.solve(S, rhs)",
                     "jax.block_until_ready(x)",
                 ]
             ),
@@ -118,6 +132,8 @@ def _forward_backend_available(backend) -> bool:
         return True
     if "JAX_DENSE" in name:
         return True
+    if "EIGEN" in name:
+        return _schur_backend_available(SchurSolverBackend.EIGEN)
 
     # FFI backends
     if "PCG_FFI" in name:
@@ -131,8 +147,8 @@ def _forward_backend_available(backend) -> bool:
             "\n".join(
                 [
                     "import jax; import jax.numpy as jnp",
-                    "from turbompc.solvers.admm.admm_ffi_backend import _find_lib",
-                    "_find_lib()",
+                    "from turbompc.solvers.admm.admm_ffi_backend import _LIB",
+                    "_LIB",
                 ]
             ),
             "fused_pcg",
@@ -142,11 +158,8 @@ def _forward_backend_available(backend) -> bool:
             "\n".join(
                 [
                     "import jax; import jax.numpy as jnp",
-                    (
-                        "from turbompc.solvers.admm.admm_cudss_ffi_backend import"
-                        " _find_lib"
-                    ),
-                    "_find_lib()",
+                    "from turbompc.solvers.admm.admm_cudss_ffi_backend import _LIB",
+                    "_LIB",
                 ]
             ),
             "fused_cudss",
@@ -156,11 +169,8 @@ def _forward_backend_available(backend) -> bool:
             "\n".join(
                 [
                     "import jax; import jax.numpy as jnp",
-                    (
-                        "from turbompc.solvers.backward.backward_kkt_cudss_ffi import"
-                        " _find_lib"
-                    ),
-                    "_find_lib()",
+                    "from turbompc.solvers.backward.backward_kkt_cudss_ffi import _LIB",
+                    "_LIB",
                 ]
             ),
             "direct_cudss_ffi",
@@ -175,11 +185,15 @@ def backend_param(backend, marks=()):
     needs_check = False
 
     if isinstance(backend, SchurSolverBackend):
-        if backend in {SchurSolverBackend.PCG_FFI, SchurSolverBackend.CUDSS_FFI}:
+        if backend in {
+            SchurSolverBackend.PCG_FFI,
+            SchurSolverBackend.CUDSS_FFI,
+            SchurSolverBackend.EIGEN,
+        }:
             needs_check = True
     elif isinstance(backend, (ForwardBackend, BackwardBackend)):
         name = backend.name
-        if any(k in name for k in ("FFI", "FUSED", "DIRECT")):
+        if any(k in name for k in ("FFI", "FUSED", "DIRECT", "EIGEN")):
             needs_check = True
     else:
         raise TypeError(f"Expected backend enum, got {type(backend)}")

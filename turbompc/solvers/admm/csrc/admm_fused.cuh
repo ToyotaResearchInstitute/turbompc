@@ -1,4 +1,5 @@
 #pragma once
+#include "constraint_handling.cuh"
 #include <cuda_runtime.h>
 #include <cstdint>
 
@@ -6,9 +7,13 @@
 struct ADMMConfig {
     int32_t max_iter;        // Maximum ADMM iterations
     int32_t pcg_max_iter;    // Maximum PCG iterations per ADMM step
-    int32_t check_every;     // Check convergence every N iterations
+    int32_t check_termination_every; // Check convergence every N iterations
+    int32_t check_infeasibility_every; // Check certificates every N iterations
+    ConstraintHandling constraint_handling; // Inequality proximal to apply
     double  eps_abs;         // Absolute convergence tolerance
     double  eps_rel;         // Relative convergence tolerance
+    double  eps_prim_inf;    // Primal infeasibility tolerance
+    double  eps_dual_inf;    // Dual infeasibility tolerance
     double  sigma;           // Proximal regularization
     double  rho_f_factor;    // rho_f = rho_bar * rho_f_factor
     double  alpha;           // Over-relaxation parameter
@@ -17,15 +22,16 @@ struct ADMMConfig {
     bool    use_slack;       // use_slack_variables flag
     int32_t adapt_rho_every;         // Adapt rho every N iters (0 = disabled)
     double  adaptive_rho_tolerance;  // Min ratio to trigger update (e.g. 5.0)
+    double  rho_update_max_factor;   // Max rho multiplier per update
     double  rho_min;                 // Lower bound on rho_bar (e.g. 1e-6)
     double  rho_max;                 // Upper bound on rho_bar (e.g. 1e6)
+    double  log_barrier_kappa;       // Log-barrier weight (0 for projection)
 };
 
 // ---- f32 launcher ----
 cudaError_t LaunchADMMFusedF32(
     cudaStream_t stream,
     // Outputs
-    float*    x_out,           // [Nb, T, n]
     uint32_t* iters_out,       // [Nb]
     float*    x_blocks_out,    // [Nb, T, n]   warm-start output
     float*    z_g_out,         // [Nb, T, m]
@@ -35,6 +41,9 @@ cudaError_t LaunchADMMFusedF32(
     float*    xi_g_out,        // [Nb, T, m]
     float*    rho_bar_out,     // [Nb]
     float*    kernel_ns_out,   // [Nb]  GPU kernel time in nanoseconds
+    uint32_t* status_out,      // [Nb] terminal ADMMStatus values
+    float*    residuals_out,   // [Nb,4]: primal, dual, primal limit, dual limit
+    float*    certificate_work,
     float*    S_work,          // [Nb, T, n, 4n]  writable workspace for S + theta_inv
     float*    Phiinv_work,     // [Nb, T, n, 3n]  writable workspace for Phiinv
     // QP data (read-only)
@@ -74,7 +83,6 @@ cudaError_t LaunchADMMFusedF32(
 cudaError_t LaunchADMMFusedF64(
     cudaStream_t stream,
     // Outputs
-    double*   x_out,
     uint32_t* iters_out,
     double*   x_blocks_out,
     double*   z_g_out,
@@ -84,6 +92,9 @@ cudaError_t LaunchADMMFusedF64(
     double*   xi_g_out,
     double*   rho_bar_out,
     double*   kernel_ns_out,   // [Nb]  GPU kernel time in nanoseconds
+    uint32_t* status_out,
+    double*   residuals_out,
+    double*   certificate_work,
     double*   S_work,          // [Nb, T, n, 4n]  writable workspace for S + theta_inv
     double*   Phiinv_work,     // [Nb, T, n, 3n]  writable workspace for Phiinv
     // QP data (read-only)

@@ -1,209 +1,205 @@
 # Build Guide
 
-Install of turbompc (venv + Python deps + CUDA FFI kernels +
-post-install check).
+TurboMPC is installed from the repository with pip.
+
+The install builds the Python package, Eigen extension, and CUDA code (on GPU platforms).
 
 ## Prerequisites
 
-| Tool | Version | How to check |
-|---|---|---|
-| Python | 3.10+ | `python3 --version` |
-| CUDA Toolkit | 12.x | `nvcc --version` |
-| CMake | 3.20+ | `cmake --version` |
-| NVIDIA driver | supports your CUDA Toolkit | `nvidia-smi` |
-| C++ compiler | supports C++17 (GCC 9+, Clang 10+) | `g++ --version` |
+TurboMPC supports Python 3.10+ and is tested on Ubuntu 22.04.
 
-
-## Fresh Install
+Install the common
+build tools and Eigen headers with:
 
 ```bash
-git clone git@github.com:ToyotaResearchInstitute/turbompc.git
+sudo apt install build-essential cmake libeigen3-dev python3-dev python3-venv
+```
+
+A GPU installation requires (check `nvcc --version` and `nvidia-smi`):
+
+- CUDA Toolkit 12.x, including `nvcc`,
+- An NVIDIA driver compatible with the toolkit.
+
+`pip` handles Python dependencies.
+
+## Install
+
+Clone the repository and create a virtual environment:
+
+```bash
+git clone https://github.com/ToyotaResearchInstitute/turbompc.git
 cd turbompc
-make install
+python -m venv .venv
 source .venv/bin/activate
 ```
 
-Expected `make check` output on a fully-built install:
-
-```
-Python: /.../.venv/bin/python (3.13)
-JAX: 0.10.x, devices: [CudaDevice(id=0)]
-cuSolver: OK
-turbompc: OK
-fused_pcg FFI: OK
-fused_cudss FFI: OK
-pcg FFI: OK
-cudss FFI: OK
-cudss KKT FFI: OK
-
-All checks passed
-```
-
-### Install with an existing venv
-
-The build defaults to an in-repo `.venv/`. To use a different one: e.g.
-a shared workspace venv: pass `VENV` (relative or absolute) to any
-target:
+For an NVIDIA GPU installation:
 
 ```bash
-make install VENV=/path/to/shared/.venv   # or: make cuda check VENV=../.venv
+TURBOMPC_CUDA=ON python -m pip install -e ".[cuda12]"
 ```
 
-### Details
-
-`make install` runs four targets in order:
-
-1. `make venv`: creates `.venv/` via `python3 -m venv`.
-2. `make pip`: upgrades pip, installs `jax[cuda12]`, `nvidia-cudss-cu12`,
-   and the project itself in editable mode with the `dev` extra.
-   Verifies JAX can see the GPU.
-3. `make cuda`: runs CMake against `turbompc/solvers/csrc/`, building
-   the five FFI shared libraries (see
-   [cuda-ffi-backends.md](cuda-ffi-backends.md) for the list).
-4. `make check`: runs `check_install.py`, which imports each
-   FFI wrapper and calls `_find_lib()` to confirm the `.so` is loadable.
-
-Summary of commands:
-
-| Target | What it does | When to use |
-|---|---|---|
-| `make venv` | Create `.venv/` if missing | First time, or after `rm -rf .venv/` |
-| `make pip` | Install / reinstall Python deps | After editing `pyproject.toml` or pulling new deps |
-| `make cuda` | Compile FFI libs via CMake | After editing `.cu` / `.cc` / `.cuh` files |
-| `make check` | Verify install end-to-end | After `make cuda`, or to debug a stale install |
-| `make torch-env` | Create isolated Torch CUDA env in `venv-torch/` | When you need PyTorch without changing JAX CUDA deps |
-| `make test` | Default test suite | CI / regression |
-| `make test-extended` | Default + extended tests | Broad coverage |
-| `make clean` | Remove `build/ffi*` | Force a full CUDA rebuild |
-
-## Separate PyTorch environment
-
-If you use both JAX CUDA wheels and PyTorch CUDA wheels, keep them in
-separate virtual environments to avoid pip resolver conflicts on
-`nvidia-*` packages.
-Create a dedicated Torch env:
+For a CPU-only installation:
 
 ```bash
-make torch-env
-source venv-torch/bin/activate
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+TURBOMPC_CUDA=OFF python -m pip install -e .
 ```
 
-`make torch-env` installs `torch==2.10.0` from the CUDA 12.8 wheel index
-in `venv-torch/`, leaving the main turbompc JAX env untouched.
-
-## Manual build (without `make`)
-
-If you need finer control, reproduce what `make install` does step by
-step:
+Verify the installation:
 
 ```bash
-# 1. venv
-python3 -m venv .venv
-source .venv/bin/activate
-
-# 2. Python deps
-pip install --upgrade pip
-pip install "jax[cuda12]"
-pip install nvidia-cudss-cu12
-pip install -e ".[dev]"
-
-# 3. Verify JAX + GPU
-python -c "import jax; assert any(d.platform in ('gpu','cuda') for d in jax.devices())"
-
-# 4. CUDA FFI kernels
-cmake -S turbompc/solvers/csrc -B build/ffi -DCMAKE_BUILD_TYPE=Release \
-      -DPython3_EXECUTABLE=$(pwd)/.venv/bin/python \
-      -DPython3_FIND_VIRTUALENV=ONLY
-cmake --build build/ffi -j
-
-# 5. Verify FFI imports
-python check_install.py
+turbompc-check
 ```
 
-### GPU architecture selection
+Python edits take effect immediately.
 
-CMake auto-detects the GPU via `nvidia-smi --query-gpu=compute_cap`
-(on cmake < 3.24 it falls back to `native`, and if that fails, to
-`75;80;86;89;90;120`: a broad fat-binary). To cross-compile for a
-specific arch, pass `-DCMAKE_CUDA_ARCHITECTURES="89"` (Ada) or
-`"80;90"` (Ampere + Ada) to the first `cmake -S ... -B ...` invocation.
+After changing C++ or CUDA source files,
+rerun the same install command to rebuild. Compiled CUDA
+code is installed under `turbompc/solvers/_ffi` and discovered
+automatically.
 
-Verify what CMake actually used:
+### Build controls
+
+The `[cuda12]` extra installs the CUDA dependencies. The
+`TURBOMPC_CUDA` environment variable controls whether CUDA libraries are
+compiled:
+
+| Value | Behavior |
+|---|---|
+| `ON` | Require CUDA libraries. Fails if the CUDA toolkit is unavailable. |
+| `OFF` | Do not build CUDA libraries. |
+| `AUTO` (default) | Build CUDA libraries when a toolkit is found. Skip otherwise. |
+
+`AUTO` is the default when the variable is omitted. Set the variable before an
+
+`TURBOMPC_EIGEN` uses the same `ON`, `OFF`, and `AUTO` values for the Eigen
+extension. Its default is also `AUTO`.
+
+### GPU architecture
+
+With CMake 3.24+, TurboMPC builds for the GPU on the current machine. Older
+CMake versions query `nvidia-smi` and fall back to different architectures
+if detection fails.
+
+To build for a specific cuda architecture, pass it through `CMAKE_ARGS`:
+
 ```bash
-grep CMAKE_CUDA_ARCHITECTURES build/ffi/CMakeCache.txt
+CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=89" \
+  TURBOMPC_CUDA=ON python -m pip install -e ".[cuda12]"
 ```
+
+The selected value is recorded in `build/skbuild/*/CMakeCache.txt`.
+
+### Direct CMake builds
+
+Use CMake directly only for one-off targets that pip does not install, such as
+the profiling library:
+
+```bash
+cmake -S . -B build/profile \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DTURBOMPC_CUDA=ON \
+  -DPython3_EXECUTABLE="$(pwd)/.venv/bin/python" \
+  -DPython3_FIND_VIRTUALENV=ONLY
+cmake --build build/profile -j --target admm_fused_profile_ffi
+ADMM_FFI_LIB=build/profile/libadmm_fused_profile_ffi.so python ...
+```
+
 
 ## Troubleshooting
 
+### Force a clean rebuild
 
+If a native library is stale or reports an undefined symbol, remove the cached
+build and reinstall:
 
-### `undefined symbol` error
-Run
-```
-make clean && make cuda
-```
-and do a full rebuild.
-
-
-### `make pip` fails with `No GPU found!`
-
-JAX's CUDA 12 wheel ships its own CUDA runtime, but it needs a matching
-NVIDIA driver on the host. Check:
 ```bash
-nvidia-smi        # driver version must support CUDA 12
+rm -rf build/skbuild
+rm -f turbompc/solvers/linear_systems_solvers/_eigen_block_tridi*.so
+TURBOMPC_CUDA=ON python -m pip install -e ".[cuda12]"
+```
+
+Use the CPU install command instead on a CPU-only system.
+
+### JAX does not see the GPU
+
+Check the driver and the devices visible to JAX:
+
+```bash
+nvidia-smi
 python -c "import jax; print(jax.devices())"
 ```
-If `jax.devices()` shows only CPU, see the
-[JAX GPU install guide](https://jax.readthedocs.io/en/latest/installation.html#nvidia-gpu).
 
-### `make cuda` fails with `nvcc fatal : Unsupported gpu architecture`
+JAX's CUDA 12 package includes the CUDA runtime but still requires a compatible
+host driver. See the
+[JAX GPU installation guide](https://docs.jax.dev/en/latest/installation.html#nvidia-gpu).
 
-Your CUDA Toolkit is older than the auto-detected architecture target.
-Two options:
-- Upgrade the CUDA Toolkit to one that supports your GPU's compute
-  capability.
-- Override with an older arch: `make clean && CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=80" make cuda`
-  (replace `80` with whichever arch your toolkit supports).
+### Unsupported GPU architecture
 
-### `make check` shows `NOT BUILT` for some FFI backends
+If `nvcc` reports an unsupported GPU architecture, upgrade the CUDA Toolkit or
+build for an architecture supported by the installed toolkit:
 
-One or more `.so` files didn't compile. Re-run `make cuda` with
-verbose output:
 ```bash
-make clean
-cmake --build build/ffi -j --verbose 2>&1 | tee /tmp/cuda_build.log
+rm -rf build/skbuild
+CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=80" \
+  TURBOMPC_CUDA=ON python -m pip install -e ".[cuda12]"
 ```
-Scan for `error:` in the log. Common causes:
-- Missing cuDSS headers: `pip install nvidia-cudss-cu12` didn't run.
-- `cudss.h: No such file`: the cuDSS Python wheel's include dir isn't
-  on the CMake search path. CMake picks it up from the venv's
-  `site-packages/nvidia/cu12/include/`; confirm the files are there.
 
-### `NOT_FOUND: No FFI handler registered for ...`
+Find the CUDA architecture for your GPU with:
 
-The Python wrapper couldn't find its `.so` at import time. Verify:
 ```bash
-ls -lh build/ffi/lib*.so
-python -c "from turbompc.solvers.admm.admm_ffi_backend import _find_lib; print(_find_lib())"
+nvidia-smi --query-gpu=compute_cap --format=csv,noheader
 ```
-FFI libraries are machine-specific (compiled for a specific CUDA
-version + GPU arch). Moving a `build/` directory between machines or
-changing GPUs requires `make clean && make cuda`.
 
-### Old shared libraries after branch switch
+The command prints a value such as `8.0` or `8.9`. Remove the decimal point
+when passing it to CMake: use `80` for `8.0` or `89` for `8.9`.
 
-Git never tracks `build/`. Switching between branches that changed
-`.cu` files can leave you with a stale `build/ffi/` that doesn't match
-the current sources. Run
+### cuDSS is not found
+
+The CUDA install normally provides cuDSS through the `nvidia-cudss-cu12`
+package. Confirm it is installed, then rebuild:
+
 ```bash
-make clean && make cuda
+python -m pip install "nvidia-cudss-cu12>=1.0,<2"
+TURBOMPC_CUDA=ON python -m pip install -e ".[cuda12]"
 ```
-and rebuild.
 
+For a system installation, set `CUDSS_DIR` to the directory containing its
+`include` and `lib` directories.
+
+### A backend is reported as `NOT BUILT`
+
+Rebuild with verbose output:
+
+```bash
+rm -rf build/skbuild
+TURBOMPC_CUDA=ON python -m pip install -e ".[cuda12]" -v \
+  2>&1 | tee /tmp/turbompc-build.log
+```
+
+Setting `TURBOMPC_CUDA=ON` turns a missing CUDA compiler into an installation
+error instead of silently producing a CPU-only build.
+
+If the Eigen backend is missing, install its headers and rebuild:
+
+```bash
+sudo apt install libeigen3-dev
+TURBOMPC_EIGEN=ON python -m pip install -e ".[cuda12]"
+```
+
+### Unable to load cuSPARSE
+
+When using TurboMPC on the GPU, `RuntimeError: Unable to load cuSPARSE. Is it installed?`
+can be resolved by running:
+
+```bash
+unset LD_LIBRARY_PATH
+```
+`python -c "import jax; print(jax.devices())"` should then show a GPU device.
 
 ## See also
 
-- [cuda-ffi-backends.md](cuda-ffi-backends.md): what each backend does and how to pick one.
-- [`Makefile`](../Makefile): the install definition.
-- [`check_install.py`](../check_install.py): for validation.
+- [CUDA backends](cuda_backends.md) explains the available GPU backends.
+- [`pyproject.toml`](../pyproject.toml) and [`CMakeLists.txt`](../CMakeLists.txt)
+  define the build.
+- `turbompc-check` validates the installed package and libraries.

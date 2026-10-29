@@ -2,7 +2,9 @@
 import jax
 import jax.numpy as jnp
 import pytest
+
 from tests.helpers.backend_utils import backend_available
+from tests.helpers.constraint_handling_fixtures import HANDLINGS, with_handling
 from tests.helpers.problem_fixtures import make_spacecraft_params
 from tests.helpers.solver_fixtures import turbompc_solver_params
 from turbompc.dynamics.spacecraft_dynamics import SpacecraftDynamics
@@ -15,12 +17,12 @@ from turbompc.solvers.turbompc_solver import (
 )
 
 
-def _make_gradient_setup():
+def _make_gradient_setup(log_barrier_kappa):
     horizon = 10
     params = make_spacecraft_params(horizon=horizon)
     dynamics = SpacecraftDynamics()
     ocp = OptimalControlProblem(dynamics=dynamics, params=params)
-    sp = turbompc_solver_params(tol=1e-8)
+    sp = with_handling(turbompc_solver_params(tol=1e-8), log_barrier_kappa)
     weights = {
         "weights_penalization_reference_state_trajectory": params[
             "weights_penalization_reference_state_trajectory"
@@ -45,9 +47,10 @@ def _make_objective(solver, params):
 @pytest.mark.skipif(
     not backend_available(SchurSolverBackend.PCG_FFI), reason="PCG FFI not built"
 )
-def test_pcg_ffi_backward_gradient():
+@pytest.mark.parametrize(("constraint_handling", "log_barrier_kappa"), HANDLINGS)
+def test_pcg_ffi_backward_gradient(constraint_handling, log_barrier_kappa):
     """PCG FFI gradients match pure JAX PCG gradients."""
-    ocp, sp, params, weights = _make_gradient_setup()
+    ocp, sp, params, weights = _make_gradient_setup(log_barrier_kappa)
 
     solver_ref = TurboMPCSolver(
         ocp,
@@ -73,9 +76,10 @@ def test_pcg_ffi_backward_gradient():
 @pytest.mark.skipif(
     not backend_available(SchurSolverBackend.CUDSS_FFI), reason="cuDSS FFI not built"
 )
-def test_cudss_ffi_backward_gradient():
+@pytest.mark.parametrize(("constraint_handling", "log_barrier_kappa"), HANDLINGS)
+def test_cudss_ffi_backward_gradient(constraint_handling, log_barrier_kappa):
     """cuDSS FFI gradients match pure JAX PCG gradients."""
-    ocp, sp, params, weights = _make_gradient_setup()
+    ocp, sp, params, weights = _make_gradient_setup(log_barrier_kappa)
 
     solver_ref = TurboMPCSolver(
         ocp,

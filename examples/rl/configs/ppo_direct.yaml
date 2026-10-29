@@ -1,0 +1,102 @@
+# PPO direct parameters
+# This code uses synthetic data and parameters, and does not represent any manufacturer's product.
+
+algorithm: ppo
+policy: direct
+env:
+  task: tracking
+  dt: 0.02
+  sim_dt: 0.02
+  ds: 3.0
+  horizon: 32
+  simulator_substeps: 1
+  initial_s: 37.4
+  max_episode_steps: 1000
+  reset_s_jitter: 0.0
+  reset_state_noise: [0.05, 0.25, 0.01, 0.25, 0.05, 0.02]
+  progress_weight: 0.0
+  tracking_weight: 20.0
+  tracking_weight_scales: [1.0, 5.0, 0.5, 5.0, 1.0, 1.0]
+  failure_penalty: 50.0
+  bound_violation_weight: 500.0
+  failure_min_speed: 9.5
+  stall_reset_speed: 9.5
+  off_track_grace_steps: 0
+  state_min_bounds: [-1.0e9, 0.5, -1.0e9, -1.0e9, -4.0, -1.0e9, -1.0e9]
+  state_max_bounds: [1.0e9, 30.0, 1.0e9, 1.0e9, 4.0, 1.0e9, 1.0e9]
+  control_min_bounds: [-0.5, -4000.0, -5000.0]
+  control_max_bounds: [0.5, 370.0, 0.0]
+  domain_randomization:
+    start: uniform
+    start_range: [37.4, 551.5]
+    physics:
+      front_friction_coefficient: [1.0, 1.0]
+      rear_friction_coefficient: [1.0, 1.0]
+controller:
+  pd:
+    enabled: true
+    compile: true
+    lateral_kp: 0.1
+    lateral_kd: 0.25
+    longitudinal_pid:
+      enabled: true
+      throttle_deadband_mps: 0.2
+      brake_deadband_mps: 0.4
+      brake_rear_fraction: 0.5
+      throttle:
+        kp: 0.5
+        ki: 0.1
+        kd: 0.01
+        integral_limit: 0.5
+        command_limit_nm: 370.0
+      brake:
+        kp: 20.0
+        ki: 0.0
+        kd: 0.01
+        integral_limit: 15.0
+        command_limit_nm: 3300.0
+  action_scale: [0.3, 400.0, 2700.0]
+training:
+  batch_size: 1024
+  device: cuda
+  actor:
+    hidden_sizes: [256, 256]
+    activation: relu
+    output_gain: 0.0
+    initial_sigma: [0.0025, 5.0, 10.0]
+    learn_sigma: true
+  critic:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    output_gain: 1.0
+  ppo:
+    seed: 0
+    total_updates: 100
+    num_steps: 128
+    num_minibatches: 32
+    update_epochs: 10
+    actor_learning_rate: 0.0001
+    critic_learning_rate: 0.001
+    adam_betas: [0.9, 0.999]
+    adam_epsilon: 1.0e-05
+    anneal_lr: true
+    final_actor_learning_rate: 0.0
+    final_critic_learning_rate: 0.001
+    gamma: 0.99
+    gae_lambda: 0.95
+    clip_coef: 0.2
+    norm_adv: true
+    clip_vloss: true
+    ent_coef: 0.001
+    vf_coef: 0.5
+    max_grad_norm: 1.0
+    target_kl: 0.02
+    normalize_obs: false
+    normalize_reward: true
+    obs_clip: 10.0
+    reward_clip: 100.0
+    eval_every: 10
+    checkpoint_every: 10
+evaluation:
+  num_envs: 1
+  steps: 1000

@@ -5,6 +5,7 @@ With rotation defined using a right-handed quaternion (not JPL convention).
 from typing import Any, Dict
 
 import jax.numpy as jnp
+
 from turbompc.dynamics.base_dynamics import Dynamics
 
 quadrotor_parameters: Dict[str, Any] = {

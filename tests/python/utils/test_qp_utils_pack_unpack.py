@@ -1,5 +1,6 @@
 import jax.numpy as jnp
 import numpy as np
+
 from turbompc.solvers.qp_utils import (
     ZShape,
     pack_box_bounds,

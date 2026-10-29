@@ -9,6 +9,7 @@ import pytest
 jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
+
 from tests.helpers.backend_utils import backend_available
 from tests.helpers.ocp_fixtures import (
     make_linear_ocp,
@@ -24,6 +25,7 @@ from turbompc.solvers.linear_systems_solvers.backends import SchurSolverBackend
 from turbompc.solvers.turbompc_solver import (
     BackwardBackend,
     ForwardBackend,
+    HessianApproximation,
     TurboMPCSolver,
 )
 from turbompc.utils.gradient_finitediff import gradient_finite_diff
@@ -103,7 +105,7 @@ def test_full_hessian_requires_direct_backward():
         ocp,
         params=turbompc_solver_params(),
         backward_backend=BackwardBackend.ADMM_JAX_LOOP_PCG,
-        use_full_hessian=True,
+        backward_hessian=HessianApproximation.FULL_HESSIAN,
     )
     assert solver is not None
 
@@ -121,7 +123,7 @@ def test_full_hessian_linear_matches_gn():
         params=sp,
         forward_backend=ForwardBackend.ADMM_JAX_LOOP_PCG,
         backward_backend=BackwardBackend.DIRECT_JAX_DENSE,
-        use_full_hessian=False,
+        backward_hessian=HessianApproximation.GAUSS_NEWTON,
     )
     obj_gn, weights = _sensitivity_objective(solver_gn, params, weight_keys)
     grad_gn = jax.grad(obj_gn)(weights)
@@ -131,7 +133,7 @@ def test_full_hessian_linear_matches_gn():
         params=sp,
         forward_backend=ForwardBackend.ADMM_JAX_LOOP_PCG,
         backward_backend=BackwardBackend.DIRECT_JAX_DENSE,
-        use_full_hessian=True,
+        backward_hessian=HessianApproximation.FULL_HESSIAN,
     )
     obj_full, _ = _sensitivity_objective(solver_full, params, weight_keys)
     grad_full = jax.grad(obj_full)(weights)
@@ -152,7 +154,7 @@ def test_spacecraft_full_hessian_matches_fd_and_beats_gn():
         params=sp,
         forward_backend=ForwardBackend.ADMM_JAX_LOOP_PCG,
         backward_backend=BackwardBackend.DIRECT_JAX_DENSE,
-        use_full_hessian=False,
+        backward_hessian=HessianApproximation.GAUSS_NEWTON,
     )
     obj_gn, weights = _sensitivity_objective(solver_gn, params, weight_keys)
     grad_gn = jax.grad(obj_gn)(weights)
@@ -162,7 +164,7 @@ def test_spacecraft_full_hessian_matches_fd_and_beats_gn():
         params=sp,
         forward_backend=ForwardBackend.ADMM_JAX_LOOP_PCG,
         backward_backend=BackwardBackend.DIRECT_JAX_DENSE,
-        use_full_hessian=True,
+        backward_hessian=HessianApproximation.FULL_HESSIAN,
     )
     obj_full, _ = _sensitivity_objective(solver_full, params, weight_keys)
     grad_full = jax.grad(obj_full)(weights)
@@ -243,7 +245,7 @@ def test_cudss_full_hessian_matches_finite_diff(
         params=turbompc_solver_params(tol=1e-6),
         forward_backend=ForwardBackend.ADMM_JAX_LOOP_CUDSS_FFI,
         backward_backend=BackwardBackend.DIRECT_JAX_DENSE,
-        use_full_hessian=True,
+        backward_hessian=HessianApproximation.FULL_HESSIAN,
     )
     weight_keys = ["weights_penalization_reference_state_trajectory"]
     obj, weights = _sensitivity_objective(solver, params, weight_keys)

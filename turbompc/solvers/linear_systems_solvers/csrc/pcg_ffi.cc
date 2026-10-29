@@ -12,7 +12,7 @@ using BufU32 = ffi::Buffer<ffi::DataType::U32>;
 
 template<typename BufT, typename Scalar>
 static ffi::Error PcgBlkTridiCudaImpl(
-    cudaStream_t stream,
+    ffi::ScratchAllocator scratch, cudaStream_t stream,
     BufT S, BufT Phiinv, BufT rhs, BufT x0,
     int64_t max_iters64,
     double eps_d,
@@ -81,28 +81,35 @@ static ffi::Error PcgBlkTridiCudaImpl(
     int32_t max_iters = static_cast<int32_t>(max_iters64);
     Scalar eps = static_cast<Scalar>(eps_d);
 
-    if constexpr (std::is_same_v<Scalar, float>) {
-        LaunchPcgBlkTridiF32(
-            stream,
-            x_out->typed_data(),
-            iterations->typed_data(),
-            S.typed_data(),
-            Phiinv.typed_data(),
-            rhs.typed_data(),
-            x0.typed_data(),
-            eps,
-            max_iters, T, n, Nb);
-    } else {
-        LaunchPcgBlkTridiF64(
-            stream,
-            x_out->typed_data(),
-            iterations->typed_data(),
-            S.typed_data(),
-            Phiinv.typed_data(),
-            rhs.typed_data(),
-            x0.typed_data(),
-            eps,
-            max_iters, T, n, Nb);
+    try {
+        if constexpr (std::is_same_v<Scalar, float>) {
+            LaunchPcgBlkTridiF32(
+                scratch,
+                stream,
+                x_out->typed_data(),
+                iterations->typed_data(),
+                S.typed_data(),
+                Phiinv.typed_data(),
+                rhs.typed_data(),
+                x0.typed_data(),
+                eps,
+                max_iters, T, n, Nb);
+        } else {
+            LaunchPcgBlkTridiF64(
+                scratch,
+                stream,
+                x_out->typed_data(),
+                iterations->typed_data(),
+                S.typed_data(),
+                Phiinv.typed_data(),
+                rhs.typed_data(),
+                x0.typed_data(),
+                eps,
+                max_iters, T, n, Nb);
+        }
+    } catch (const std::exception& error) {
+        cudaStreamSynchronize(stream);
+        return ffi::Error::Internal(error.what());
     }
 
     cudaError_t err = cudaPeekAtLastError();
@@ -115,6 +122,7 @@ static ffi::Error PcgBlkTridiCudaImpl(
 extern "C" XLA_FFI_Error* PcgBlkTridiCuda(XLA_FFI_CallFrame* call_frame) {
     static auto* handler =
         ffi::Ffi::Bind()
+            .Ctx<ffi::ScratchAllocator>()
             .Ctx<ffi::PlatformStream<cudaStream_t>>()
             .Arg<BufF32>()   // S
             .Arg<BufF32>()   // Phiinv
@@ -132,6 +140,7 @@ extern "C" XLA_FFI_Error* PcgBlkTridiCuda(XLA_FFI_CallFrame* call_frame) {
 extern "C" XLA_FFI_Error* PcgBlkTridiCudaF64(XLA_FFI_CallFrame* call_frame) {
     static auto* handler =
         ffi::Ffi::Bind()
+            .Ctx<ffi::ScratchAllocator>()
             .Ctx<ffi::PlatformStream<cudaStream_t>>()
             .Arg<BufF64>()   // S
             .Arg<BufF64>()   // Phiinv

@@ -1,0 +1,51 @@
+# States: yaw_rate, lin_vel, sideslip, rear_wheel_speed,
+#         lateral_deviation, relative_heading, time_evolution
+# Controls: steering_angle, motor_plus_rear_brake_torques, front_brake_torque
+
+horizon: 40
+discretization_resolution: 3.0
+discretization_scheme: 10
+
+initial_state: [0., 1., 0., 1., 0., 0., 0.]
+initial_guess_final_state: [0., 1., 0., 1., 0., 0., 0.]
+constrain_initial_control: false
+initial_control: [0., 0., 0.]
+
+reference_state_trajectory: [0., 1., 0., 1., 0., 0., 0.]
+reference_control_trajectory: [0., 0., 0.]
+penalize_control_reference: true
+
+weights_penalization_reference_state_trajectory: [10., 0.02, 1., 0.002, 30., 5., 0.]
+weights_penalization_final_state: [0., 0., 0., 0., 0., 0., 0.]
+weights_linear_penalization_final_state: [0., 0., 0., 0., 0., 0., 10.]
+weights_penalization_control_squared: [0.1, 1.E-5, 1.E-5]
+weights_penalization_control_rate: [2.E+4, 1.E-5, 1.E-9]
+
+state_min_bounds: [-1.E+9, 0.5, -1.E+9, -1.E+9, -4., -1.E+9, -1.E+9]
+state_max_bounds: [1.E+9, 30., 1.E+9, 1.E+9, 4., 1.E+9, 1.E+9]
+control_min_bounds: [-0.5, -4.E+3, -5.E+3]
+control_max_bounds: [0.5, 370., 0.]
+
+use_slack_variables: true
+slack_penalization_weight: 1.E+3
+
+rescale_optimization_variables: true
+state_rescaling_min: [-1., -30., -0.5, -30., -5., -1., -10.]
+state_rescaling_max: [1., 30., 0.5, 30., 5., 1., 10.]
+control_rescaling_min: [-0.5, -5.E+3, -5.E+3]
+control_rescaling_max: [0.5, 5.E+3, 5.E+3]
+
+# approximate synthetic vehicle dynamics parameters
+dynamics_state_dot_params:
+  curvature: 0.
+  mass: 2000.
+  yaw_moment_of_inertia: 3500.
+  front_axle_distance: 1.3
+  rear_axle_distance: 1.5
+  wheel_radius: 0.368
+  rear_wheel_moment_of_inertia: 30.
+  front_cornering_stiffness: 1.56E+5
+  rear_cornering_stiffness: 4.22E+5
+  front_friction_coefficient: 1.02
+  rear_friction_coefficient: 1.08
+  gear_ratio: 9.26

@@ -1,3 +1,5 @@
+#include "xla/ffi/api/ffi.h"
+#include <stdexcept>
 #include "pcg_blktridi.cuh"
 #include "block_tridi.cuh"
 #include <cmath>
@@ -335,7 +337,7 @@ __global__ void dotProductKernel(
 
 template<typename T>
 static void pcgBlkTridiSolveLegacy(
-    cudaStream_t stream,
+    cudaStream_t stream, T* workspace,
     T* x_out,
     uint32_t* iters_out,
     const T* S,
@@ -355,13 +357,11 @@ static void pcgBlkTridiSolveLegacy(
     int dot_blocks = (total + elem_threads - 1) / elem_threads;
     if (dot_blocks > 256) dot_blocks = 256;
 
-    T *r_dev, *z_dev, *p_dev, *Sp_dev;
-    T *dot_buf;
-    cudaMallocAsync(&r_dev, total * sizeof(T), stream);
-    cudaMallocAsync(&z_dev, total * sizeof(T), stream);
-    cudaMallocAsync(&p_dev, total * sizeof(T), stream);
-    cudaMallocAsync(&Sp_dev, total * sizeof(T), stream);
-    cudaMallocAsync(&dot_buf, sizeof(T), stream);
+    T* r_dev = workspace;
+    T* z_dev = r_dev + total;
+    T* p_dev = z_dev + total;
+    T* Sp_dev = p_dev + total;
+    T* dot_buf = Sp_dev + total;
 
     pcgCopyKernel<<<elem_blocks, elem_threads, 0, stream>>>(x_out, x0, total);
 
@@ -418,11 +418,6 @@ static void pcgBlkTridiSolveLegacy(
     cudaStreamSynchronize(stream);
     cudaMemcpy(iters_out, &k, sizeof(uint32_t), cudaMemcpyHostToDevice);
 
-    cudaFreeAsync(r_dev, stream);
-    cudaFreeAsync(z_dev, stream);
-    cudaFreeAsync(p_dev, stream);
-    cudaFreeAsync(Sp_dev, stream);
-    cudaFreeAsync(dot_buf, stream);
 }
 
 // ============================================================
@@ -431,6 +426,7 @@ static void pcgBlkTridiSolveLegacy(
 
 template<typename T>
 static void pcgBlkTridiSolve(
+    xla::ffi::ScratchAllocator& scratch,
     cudaStream_t stream,
     T* x_out,
     uint32_t* iters_out,
@@ -459,12 +455,16 @@ static void pcgBlkTridiSolve(
             x_out, iters_out, S, Phiinv, rhs, x0,
             eps, max_iters, T_blocks, n);
     } else {
+        // One XLA scratch allocation reused for every element of the batch.
+        auto allocation = scratch.Allocate((4 * static_cast<size_t>(total) + 1) * sizeof(T), alignof(T));
+        if (!allocation) throw std::runtime_error("XLA could not allocate PCG scratch memory");
+        T* workspace = static_cast<T*>(*allocation);
         // Fallback: multi-kernel with host-device syncs (sequential over batch)
         int S_stride   = T_blocks * n * 3 * n;
         int vec_stride = total;
         for (int b = 0; b < Nb; ++b) {
             pcgBlkTridiSolveLegacy<T>(
-                stream,
+                stream, workspace,
                 x_out    + b * vec_stride,
                 iters_out + b,
                 S        + b * S_stride,
@@ -477,19 +477,21 @@ static void pcgBlkTridiSolve(
 }
 
 void LaunchPcgBlkTridiF32(
+    xla::ffi::ScratchAllocator& scratch,
     cudaStream_t stream, float* x_out, uint32_t* iters_out,
     const float* S, const float* Phiinv, const float* rhs, const float* x0,
     float eps, int32_t max_iters, int32_t T_blocks, int32_t n, int32_t Nb)
 {
-    pcgBlkTridiSolve<float>(stream, x_out, iters_out, S, Phiinv, rhs, x0,
+    pcgBlkTridiSolve<float>(scratch, stream, x_out, iters_out, S, Phiinv, rhs, x0,
                             eps, max_iters, T_blocks, n, Nb);
 }
 
 void LaunchPcgBlkTridiF64(
+    xla::ffi::ScratchAllocator& scratch,
     cudaStream_t stream, double* x_out, uint32_t* iters_out,
     const double* S, const double* Phiinv, const double* rhs, const double* x0,
     double eps, int32_t max_iters, int32_t T_blocks, int32_t n, int32_t Nb)
 {
-    pcgBlkTridiSolve<double>(stream, x_out, iters_out, S, Phiinv, rhs, x0,
+    pcgBlkTridiSolve<double>(scratch, stream, x_out, iters_out, S, Phiinv, rhs, x0,
                              eps, max_iters, T_blocks, n, Nb);
 }

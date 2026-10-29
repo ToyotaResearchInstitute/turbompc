@@ -1,34 +1,33 @@
 """ADMM solver with cuDSS direct solve via CUDA FFI (host-side ADMM loop)."""
 from __future__ import annotations
 
-import ctypes
-from pathlib import Path
-from typing import Tuple
-
 import jax
 import jax.numpy as jnp
-from turbompc.solvers.admm.admm import ADMMSolveResult, ADMMState
+import numpy as np
+
+from turbompc.solvers.admm.admm import ADMMState, ADMMStats, FusedADMMSolveResult
+from turbompc.solvers.constraint_handling import ConstraintHandling
+from turbompc.solvers.ffi_loader import load_ffi_lib
 from turbompc.solvers.linear_systems_solvers.pcg_primal import SchurComplementMatrices
 from turbompc.solvers.qp_data import QPData
 
-
-def _find_lib() -> Path:
-    turbompc_root = Path(__file__).resolve().parents[2]
-    candidates = [
-        turbompc_root / "solvers" / "csrc" / "build" / "libadmm_cudss_ffi.so",
-        turbompc_root.parent / "build" / "ffi" / "libadmm_cudss_ffi.so",
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    raise FileNotFoundError(
-        "Could not find libadmm_cudss_ffi.so. Build first:\n"
-        "  cmake -S turbompc/solvers/csrc -B build/ffi -DCMAKE_BUILD_TYPE=Release\n"
-        "  cmake --build build/ffi -j\n"
-    )
-
-
-_LIB = ctypes.cdll.LoadLibrary(str(_find_lib()))
+_LIB_NAME = "libadmm_cudss_ffi.so"
+_LIB = load_ffi_lib(_LIB_NAME, env_var="ADMM_CUDSS_FFI_LIB")
+jax.ffi.register_ffi_target(
+    "admm_cudss_workspace_create",
+    jax.ffi.pycapsule(_LIB.TurboMpcCreateAdmmCudssWorkspace),
+    platform="CUDA",
+)
+jax.ffi.register_ffi_target(
+    "admm_cudss_workspace_ensure_capacity",
+    jax.ffi.pycapsule(_LIB.TurboMpcEnsureAdmmCudssWorkspaceCapacity),
+    platform="CUDA",
+)
+jax.ffi.register_ffi_target(
+    "admm_cudss_workspace_destroy",
+    jax.ffi.pycapsule(_LIB.TurboMpcDestroyAdmmCudssWorkspace),
+    platform="CUDA",
+)
 
 jax.ffi.register_ffi_target(
     "admm_cudss_cuda",
@@ -41,55 +40,118 @@ jax.ffi.register_ffi_target(
     platform="CUDA",
 )
 
-# Configure the cache-control entry points (extern "C" — not part of the
-# JAX FFI traced graph; called directly via ctypes for cleanup/diagnostics).
-_LIB.ClearADMMCudssCacheImpl.restype = None
-_LIB.ADMMCudssCacheSize.restype = ctypes.c_int
+
+@jax.tree_util.register_pytree_node_class
+class AdmmCudssWorkspace:
+    """Own one lazily sized native workspace with a stable FFI handle."""
+
+    def __init__(self) -> None:
+        self._handle = 0
+        self._device = jax.config.jax_default_device
+        if getattr(self._device, "platform", None) != "gpu":
+            self._device = jax.local_devices(backend="gpu")[0]
+        with jax.ensure_compile_time_eval(), jax.default_device(self._device):
+            result = jax.ffi.ffi_call(
+                "admm_cudss_workspace_create",
+                jax.ShapeDtypeStruct((2,), np.uint32),
+                has_side_effect=True,
+            )()
+            result.block_until_ready()
+            self._handle = int(np.asarray(result).view(np.uint64).item())
+
+    def tree_flatten(self):
+        return (), self
+
+    @classmethod
+    def tree_unflatten(cls, owner, children):
+        del children
+        return owner
+
+    @property
+    def handle(self) -> int:
+        if self._handle == 0:
+            raise RuntimeError("ADMM cuDSS workspace is closed")
+        return self._handle
+
+    def ensure_capacity(
+        self, batch_size: int, T: int, n: int, nx: int, n0: int, m: int, dtype
+    ) -> None:
+        """Eagerly size the workspace; FFI calls do this automatically."""
+        dtype = jnp.dtype(dtype)
+        if dtype not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.float64)):
+            raise TypeError("ADMM workspace dtype must be float32 or float64")
+        with jax.ensure_compile_time_eval(), jax.default_device(self._device):
+            result = jax.ffi.ffi_call(
+                "admm_cudss_workspace_ensure_capacity",
+                jax.ShapeDtypeStruct((), np.uint32),
+                has_side_effect=True,
+            )(
+                workspace_handle=np.int64(self.handle),
+                batch_size=np.int64(batch_size),
+                T=np.int64(T),
+                n=np.int64(n),
+                nx=np.int64(nx),
+                n0=np.int64(n0),
+                m=np.int64(m),
+                dtype_bytes=np.int64(dtype.itemsize),
+            )
+            result.block_until_ready()
+
+    def close(self) -> None:
+        if self._handle == 0:
+            return
+        with jax.ensure_compile_time_eval(), jax.default_device(self._device):
+            result = jax.ffi.ffi_call(
+                "admm_cudss_workspace_destroy",
+                jax.ShapeDtypeStruct((), np.uint32),
+                has_side_effect=True,
+            )(workspace_handle=np.int64(self.handle))
+            result.block_until_ready()
+        self._handle = 0
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001, S110
+            pass
 
 
-def clear_cache() -> None:
-    """Drop every cached cuDSS handle + GPU buffer held by the cuDSS-loop
-    ADMM kernel.
-
-    The kernel keeps a process-global ``unordered_map`` of resources keyed by
-    problem dimensions; without this call, sweeping multiple horizons in one
-    process accumulates entries forever. Safe to call between solves; the
-    next solve re-creates whatever it needs.
-    """
-    _LIB.ClearADMMCudssCacheImpl()
-
-
-def admm_cudss_ffi_solve(
+def _admm_cudss_ffi_solve_impl(
     qp_data: QPData,
     schur: SchurComplementMatrices,
     state0: ADMMState,
     *,
+    workspace: AdmmCudssWorkspace,
     max_iter: int = 100,
-    check_every: int = 5,
+    check_termination_every: int = 5,
+    check_infeasibility_every: int = 25,
     adapt_rho_every: int = 0,
     eps_abs: float = 1e-4,
     eps_rel: float = 1e-3,
+    eps_prim_inf: float = 1e-4,
+    eps_dual_inf: float = 1e-4,
     sigma: float = 1e-6,
     rho_f_factor: float = 1000.0,
     alpha: float = 1.6,
     adaptive_rho_tolerance: float = 5.0,
+    rho_update_max_factor: float = 1.0e6,
     rho_min: float = 1e-6,
     rho_max: float = 1e6,
     slack_weight: float = 0.0,
     use_slack: bool = False,
-) -> Tuple[jnp.ndarray, jnp.ndarray, ADMMState]:
+    constraint_handling: int = ConstraintHandling.PROJECTION,
+    log_barrier_kappa: float = 0.0,
+) -> FusedADMMSolveResult:
     """Solve ADMM QP via host-side loop + cuDSS direct solve.
 
     Args:
         qp_data: QP problem data (cost, equality, inequality blocks)
         schur: Precomputed Schur complement matrices (S used for cuDSS)
         state0: ADMM warm-start state
-        max_iter, check_every, etc: ADMM configuration
+        max_iter and check intervals: ADMM configuration
 
     Returns:
-        x_out: primal solution (Nb, T, n) or (T, n)
-        iters_out: iteration counts (Nb,) or ()
-        state_out: final ADMM state for warm-starting
+        Iteration counts, final ADMM state, and kernel time.
     """
     dtype = qp_data.cost.q.dtype
     S = schur.S
@@ -152,11 +214,12 @@ def admm_cudss_ffi_solve(
     rho_bar_k = jnp.asarray(state0.rho_bar, dtype=kernel_dtype)
     if rho_bar_k.ndim == 0:
         rho_bar_k = rho_bar_k[None]
-    slack_weight_k = jnp.asarray(slack_weight, dtype=kernel_dtype)
+    slack_weight_k = jnp.broadcast_to(
+        jnp.asarray(slack_weight, dtype=kernel_dtype), (Nb,)
+    )
 
     # Output shapes
     out_shapes = [
-        jax.ShapeDtypeStruct((Nb, T, n), kernel_dtype),  # x_out
         jax.ShapeDtypeStruct((Nb,), jnp.uint32),  # iters_out
         jax.ShapeDtypeStruct((Nb, T, n), kernel_dtype),  # x_blocks_out
         jax.ShapeDtypeStruct((Nb, T, m), kernel_dtype),  # z_g_out
@@ -166,6 +229,8 @@ def admm_cudss_ffi_solve(
         jax.ShapeDtypeStruct((Nb, T, m), kernel_dtype),  # xi_g_out
         jax.ShapeDtypeStruct((Nb,), kernel_dtype),  # rho_bar_out
         jax.ShapeDtypeStruct((Nb,), kernel_dtype),  # kernel_ns_out
+        jax.ShapeDtypeStruct((Nb,), jnp.uint32),  # status_out
+        jax.ShapeDtypeStruct((Nb, 4), kernel_dtype),  # residuals and limits
     ]
 
     call = jax.ffi.ffi_call(
@@ -200,24 +265,30 @@ def admm_cudss_ffi_solve(
         slack_weight_k,
         # Config attrs (no pcg_max_iter, pcg_eps)
         max_iter=int(max_iter),
-        check_every=int(check_every),
+        check_termination_every=int(check_termination_every),
+        check_infeasibility_every=int(check_infeasibility_every),
         adapt_rho_every=int(adapt_rho_every),
+        constraint_handling=int(constraint_handling),
         eps_abs=float(eps_abs),
         eps_rel=float(eps_rel),
+        eps_prim_inf=float(eps_prim_inf),
+        eps_dual_inf=float(eps_dual_inf),
         sigma=float(sigma),
         rho_f_factor=float(rho_f_factor),
         alpha=float(alpha),
         adaptive_rho_tolerance=float(adaptive_rho_tolerance),
+        rho_update_max_factor=float(rho_update_max_factor),
         rho_min=float(rho_min),
         rho_max=float(rho_max),
+        log_barrier_kappa=float(log_barrier_kappa),
         nx=int(nx_dyn),
         n0=int(n0),
         m=int(m),
         use_slack=int(use_slack),
+        workspace_handle=workspace.handle,
     )
 
     (
-        x_out,
         iters_out,
         x_blocks_out,
         z_g_out,
@@ -227,11 +298,12 @@ def admm_cudss_ffi_solve(
         xi_g_out,
         rho_bar_out,
         kernel_ns_out,
+        status_out,
+        residuals_out,
     ) = results
 
     # Remove batch dim if input was unbatched
     if not batched:
-        x_out = x_out[0]
         iters_out = iters_out[0]
         x_blocks_out = x_blocks_out[0]
         z_g_out = z_g_out[0]
@@ -241,9 +313,8 @@ def admm_cudss_ffi_solve(
         xi_g_out = xi_g_out[0]
         rho_bar_out = rho_bar_out[0]
         kernel_ns_out = kernel_ns_out[0]
-
-    # Cast back to original dtype
-    x_out = jnp.asarray(x_out, dtype=dtype)
+        status_out = status_out[0]
+        residuals_out = residuals_out[0]
 
     state_out = ADMMState(
         x_blocks=jnp.asarray(x_blocks_out, dtype=dtype),
@@ -255,28 +326,43 @@ def admm_cudss_ffi_solve(
         rho_bar=jnp.asarray(rho_bar_out, dtype=dtype),
     )
 
-    return ADMMSolveResult(x_out, iters_out, state_out, kernel_ns_out)
+    stats = ADMMStats(
+        status=jnp.asarray(status_out, dtype=jnp.int32),
+        num_iter=jnp.asarray(iters_out, dtype=jnp.int32),
+        primal_residual=residuals_out[..., 0],
+        dual_residual=residuals_out[..., 1],
+        primal_residual_limit=residuals_out[..., 2],
+        dual_residual_limit=residuals_out[..., 3],
+    )
+    return FusedADMMSolveResult(state_out, stats, kernel_ns_out)
 
 
-def admm_cudss_ffi_solve_single(
+def _admm_cudss_ffi_solve_unbatched_impl(
     qp_data: QPData,
     schur: SchurComplementMatrices,
     state0: ADMMState,
     *,
+    workspace: AdmmCudssWorkspace,
     max_iter: int = 100,
-    check_every: int = 5,
+    check_termination_every: int = 5,
+    check_infeasibility_every: int = 25,
     adapt_rho_every: int = 0,
     eps_abs: float = 1e-4,
     eps_rel: float = 1e-3,
+    eps_prim_inf: float = 1e-4,
+    eps_dual_inf: float = 1e-4,
     sigma: float = 1e-6,
     rho_f_factor: float = 1000.0,
     alpha: float = 1.6,
     adaptive_rho_tolerance: float = 5.0,
+    rho_update_max_factor: float = 1.0e6,
     rho_min: float = 1e-6,
     rho_max: float = 1e6,
     slack_weight: float = 0.0,
     use_slack: bool = False,
-) -> Tuple[jnp.ndarray, jnp.ndarray, ADMMState]:
+    constraint_handling: int = ConstraintHandling.PROJECTION,
+    log_barrier_kappa: float = 0.0,
+) -> FusedADMMSolveResult:
     """ADMM-cuDSS solve for a single (unbatched) problem, vmap-compatible."""
     dtype = qp_data.cost.q.dtype
     S = schur.S  # (T, n, 3n)
@@ -324,7 +410,6 @@ def admm_cudss_ffi_solve_single(
 
     # Unbatched output shapes; C++ sees rank-3 (Nb=1), vmap maps to rank-4
     out_shapes = [
-        jax.ShapeDtypeStruct((T, n), kernel_dtype),  # x_out
         jax.ShapeDtypeStruct((), jnp.uint32),  # iters_out
         jax.ShapeDtypeStruct((T, n), kernel_dtype),  # x_blocks_out
         jax.ShapeDtypeStruct((T, m), kernel_dtype),  # z_g_out
@@ -334,6 +419,8 @@ def admm_cudss_ffi_solve_single(
         jax.ShapeDtypeStruct((T, m), kernel_dtype),  # xi_g_out
         jax.ShapeDtypeStruct((), kernel_dtype),  # rho_bar_out
         jax.ShapeDtypeStruct((), kernel_dtype),  # kernel_ns_out
+        jax.ShapeDtypeStruct((), jnp.uint32),  # status_out
+        jax.ShapeDtypeStruct((4,), kernel_dtype),  # residuals and limits
     ]
 
     call = jax.ffi.ffi_call(
@@ -364,24 +451,30 @@ def admm_cudss_ffi_solve_single(
         rho_bar_k,
         slack_weight_k,
         max_iter=int(max_iter),
-        check_every=int(check_every),
+        check_termination_every=int(check_termination_every),
+        check_infeasibility_every=int(check_infeasibility_every),
         adapt_rho_every=int(adapt_rho_every),
+        constraint_handling=int(constraint_handling),
         eps_abs=float(eps_abs),
         eps_rel=float(eps_rel),
+        eps_prim_inf=float(eps_prim_inf),
+        eps_dual_inf=float(eps_dual_inf),
         sigma=float(sigma),
         rho_f_factor=float(rho_f_factor),
         alpha=float(alpha),
         adaptive_rho_tolerance=float(adaptive_rho_tolerance),
+        rho_update_max_factor=float(rho_update_max_factor),
         rho_min=float(rho_min),
         rho_max=float(rho_max),
+        log_barrier_kappa=float(log_barrier_kappa),
         nx=int(nx_dyn),
         n0=int(n0),
         m=int(m),
         use_slack=int(use_slack),
+        workspace_handle=workspace.handle,
     )
 
     (
-        x_out,
         iters_out,
         x_blocks_out,
         z_g_out,
@@ -391,9 +484,10 @@ def admm_cudss_ffi_solve_single(
         xi_g_out,
         rho_bar_out,
         kernel_ns_out,
+        status_out,
+        residuals_out,
     ) = results
 
-    x_out = jnp.asarray(x_out, dtype=dtype)
     state_out = ADMMState(
         x_blocks=jnp.asarray(x_blocks_out, dtype=dtype),
         y_g=jnp.asarray(y_g_out, dtype=dtype),
@@ -403,4 +497,113 @@ def admm_cudss_ffi_solve_single(
         xi_g=jnp.asarray(xi_g_out, dtype=dtype),
         rho_bar=jnp.asarray(rho_bar_out, dtype=dtype),
     )
-    return ADMMSolveResult(x_out, iters_out, state_out, kernel_ns_out)
+    stats = ADMMStats(
+        status=jnp.asarray(status_out, dtype=jnp.int32),
+        num_iter=jnp.asarray(iters_out, dtype=jnp.int32),
+        primal_residual=residuals_out[0],
+        dual_residual=residuals_out[1],
+        primal_residual_limit=residuals_out[2],
+        dual_residual_limit=residuals_out[3],
+    )
+    return FusedADMMSolveResult(state_out, stats, kernel_ns_out)
+
+
+def admm_cudss_ffi_solve(
+    qp_data: QPData,
+    schur: SchurComplementMatrices,
+    state0: ADMMState,
+    *,
+    workspace: AdmmCudssWorkspace,
+    max_iter: int = 100,
+    check_termination_every: int = 5,
+    check_infeasibility_every: int = 25,
+    adapt_rho_every: int = 0,
+    eps_abs: float = 1e-4,
+    eps_rel: float = 1e-3,
+    eps_prim_inf: float = 1e-4,
+    eps_dual_inf: float = 1e-4,
+    sigma: float = 1e-6,
+    rho_f_factor: float = 1000.0,
+    alpha: float = 1.6,
+    adaptive_rho_tolerance: float = 5.0,
+    rho_update_max_factor: float = 1.0e6,
+    rho_min: float = 1e-6,
+    rho_max: float = 1e6,
+    slack_weight: float = 0.0,
+    use_slack: bool = False,
+    constraint_handling: int = ConstraintHandling.PROJECTION,
+    log_barrier_kappa: float = 0.0,
+) -> FusedADMMSolveResult:
+    """Solve one QP, combining a surrounding ``vmap`` into one FFI call.
+
+    The batching rule materializes shared leaves, then calls the native batched
+    cuDSS implementation once.  The workspace grows itself from those runtime
+    buffer dimensions while retaining its stable handle.
+    """
+
+    def solve_one(qp_data, schur, state0, slack_weight):
+        solve_impl = (
+            _admm_cudss_ffi_solve_unbatched_impl
+            if schur.S.ndim == 3
+            else _admm_cudss_ffi_solve_impl
+        )
+        return solve_impl(
+            qp_data,
+            schur,
+            state0,
+            workspace=workspace,
+            max_iter=max_iter,
+            check_termination_every=check_termination_every,
+            check_infeasibility_every=check_infeasibility_every,
+            adapt_rho_every=adapt_rho_every,
+            eps_abs=eps_abs,
+            eps_rel=eps_rel,
+            eps_prim_inf=eps_prim_inf,
+            eps_dual_inf=eps_dual_inf,
+            sigma=sigma,
+            rho_f_factor=rho_f_factor,
+            alpha=alpha,
+            adaptive_rho_tolerance=adaptive_rho_tolerance,
+            rho_update_max_factor=rho_update_max_factor,
+            rho_min=rho_min,
+            rho_max=rho_max,
+            slack_weight=slack_weight,
+            use_slack=use_slack,
+            constraint_handling=constraint_handling,
+            log_barrier_kappa=log_barrier_kappa,
+        )
+
+    solve_one = jax.custom_batching.custom_vmap(solve_one)
+
+    @solve_one.def_vmap
+    def solve_one_vmap(axis_size, in_batched, qp_data, schur, state0, slack_weight):
+        args = (qp_data, schur, state0, slack_weight)
+        leaves, treedef = jax.tree.flatten(args)
+        batched_leaves = jax.tree.leaves(in_batched)
+        if len(leaves) != len(batched_leaves):
+            raise ValueError("custom vmap flags do not match ADMM input leaves")
+
+        materialized_leaves = [
+            (
+                leaf
+                if is_batched
+                else jnp.broadcast_to(jnp.asarray(leaf), (axis_size,) + jnp.shape(leaf))
+            )
+            for leaf, is_batched in zip(leaves, batched_leaves)
+        ]
+        qp_batched, schur_batched, state_batched, slack_weight_batched = (
+            jax.tree.unflatten(treedef, materialized_leaves)
+        )
+        batch_shape = schur_batched.S.shape[:-3]
+        num_batch_dims = len(batch_shape)
+        flat_args = jax.tree.map(
+            lambda leaf: leaf.reshape((-1,) + leaf.shape[num_batch_dims:]),
+            (qp_batched, schur_batched, state_batched, slack_weight_batched),
+        )
+        output_flat = solve_one(*flat_args)
+        output = jax.tree.map(
+            lambda leaf: leaf.reshape(batch_shape + leaf.shape[1:]), output_flat
+        )
+        return output, jax.tree.map(lambda _: True, output)
+
+    return solve_one(qp_data, schur, state0, slack_weight)

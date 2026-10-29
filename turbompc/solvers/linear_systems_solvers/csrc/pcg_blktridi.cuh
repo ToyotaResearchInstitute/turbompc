@@ -2,9 +2,12 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+namespace xla { namespace ffi { class ScratchAllocator; } }
+
 constexpr int PCG_BLKTRIDI_THREADS = 128;
 
 void LaunchPcgBlkTridiF32(
+    xla::ffi::ScratchAllocator& scratch,
     cudaStream_t stream,
     float* x_out,
     uint32_t* iters_out,
@@ -19,6 +22,7 @@ void LaunchPcgBlkTridiF32(
     int32_t Nb = 1);
 
 void LaunchPcgBlkTridiF64(
+    xla::ffi::ScratchAllocator& scratch,
     cudaStream_t stream,
     double* x_out,
     uint32_t* iters_out,

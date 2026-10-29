@@ -1,4 +1,6 @@
 verbose: False
+constraint_handling: projection
+log_barrier_kappa: 0.0
 tol_convergence: 1.E-6
 num_sqp_iteration_max: 15
 linesearch: False

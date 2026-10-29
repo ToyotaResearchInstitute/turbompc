@@ -1,4 +1,7 @@
+#include "ffi_device_memory.h"
 #include "admm_cudss.cuh"
+#include "admm_infeasibility.cuh"
+#include "admm_status.cuh"
 #include "admm_math.cuh"
 #include "admm_reductions.cuh"
 #include "block_tridi.cuh"
@@ -10,6 +13,7 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <memory>
 #include <unordered_map>
 
 // Throw on cuDSS/CUDA errors so the FFI handler can return ffi::Error::Internal
@@ -56,10 +60,16 @@ __global__ void initStateKernel(
     const T* __restrict__ y_f_0_init,
     const T* __restrict__ y_f_dyn_init,
     const T* __restrict__ xi_g0,
-    int total_tn, int total_Tm, int nx_val, int total_Nnx)
+    int total_tn, int total_Tm, int nx_val, int total_Nnx,
+    uint32_t* status, uint32_t* iterations, int max_iter)
 {
     int bid = blockIdx.x;
     int tid = threadIdx.x;
+
+    if (tid == 0) {
+        status[bid] = static_cast<uint32_t>(ADMM_STATUS_NOT_RUN);
+        iterations[bid] = static_cast<uint32_t>(max_iter);
+    }
 
     for (int i = tid; i < total_tn; i += blockDim.x)
         x[bid * total_tn + i] = x0[bid * total_tn + i];
@@ -95,7 +105,8 @@ __global__ void __launch_bounds__(768) computeGammaAndSaveXOldKernel(
     const T* __restrict__ cdyn_g,// [Nb, N, nx]
     T sigma, T rho_f_factor,
     const T* __restrict__ rho_bar_arr,  // [Nb]
-    int T_blocks, int n, int nx, int n0, int m)
+    int T_blocks, int n, int nx, int n0, int m,
+    const uint32_t* __restrict__ status)
 {
     int bid = blockIdx.x;
     int tid = threadIdx.x;
@@ -122,7 +133,9 @@ __global__ void __launch_bounds__(768) computeGammaAndSaveXOldKernel(
     // Save x_old
     for (int i = tid; i < total_tn; i += blockDim.x)
         x_old[off_tn + i] = x[off_tn + i];
-    __syncthreads();
+    // cuDSS still solves every RHS. Keep the terminal primal so post-solve
+    // can restore it while the other rows continue iterating.
+    if (status[bid] != static_cast<uint32_t>(ADMM_STATUS_NOT_RUN)) return;
 
     // Compute gamma using shared device function (admm_math.cuh)
     computeGammaDevice(
@@ -135,12 +148,37 @@ __global__ void __launch_bounds__(768) computeGammaAndSaveXOldKernel(
         T_blocks, n, nx, n0, m);
 }
 
-// ---- Kernel 3: post-solve — constraints + over-relax + save z_g_old + slack + dual ----
-// Fuses: applyConstraints, overRelax, save z_g_old, slackUpdate, dualUpdate
+template<typename T>
+__global__ void snapshotCertificateDualsKernel(
+    T* previous_y_g, T* previous_y_f_0, T* previous_y_f_dyn,
+    T* previous_xi_g, const T* y_g, const T* y_f_0,
+    const T* y_f_dyn, const T* xi_g, int total_Tm, int n0, int total_Nnx)
+{
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int off_Tm = bid * total_Tm;
+    int off_n0 = bid * n0;
+    int off_Nnx = bid * total_Nnx;
+    for (int i = tid; i < total_Tm; i += blockDim.x) {
+        previous_y_g[off_Tm + i] = y_g[off_Tm + i];
+        previous_xi_g[off_Tm + i] = xi_g[off_Tm + i];
+    }
+    for (int i = tid; i < n0; i += blockDim.x)
+        previous_y_f_0[off_n0 + i] = y_f_0[off_n0 + i];
+    for (int i = tid; i < total_Nnx; i += blockDim.x)
+        previous_y_f_dyn[off_Nnx + i] = y_f_dyn[off_Nnx + i];
+}
+
+// ---- Kernel 3: post-solve — constraints + over-relax + inequality + dual ----
+// Fuses: applyConstraints, overRelax, save z_g_old, inequality proximal, dualUpdate
 //
 // rho_bar is read per-block from rho_bar_arr[bid]; rho_f = rho_bar * rho_f_factor.
-// slack_weight is read from slack_weight_arr[0] (single device scalar).
-template<typename T>
+// rho_bar and slack_weight are read per batch.
+//
+// `Handling` selects the inequality proximal at compile time, so the projection
+// path carries none of the barrier code. The host launcher picks the
+// instantiation; everything else is shared.
+template<typename T, ConstraintHandling Handling>
 __global__ void __launch_bounds__(768) postSolveKernel(
     T* __restrict__ x,           // [Nb, T*n] — in/out (over-relaxed)
     T* __restrict__ z_g,         // [Nb, T*m] — in/out (updated slack)
@@ -165,8 +203,9 @@ __global__ void __launch_bounds__(768) postSolveKernel(
     T alpha_relax, T rho_f_factor,
     const T* __restrict__ rho_bar_arr,    // [Nb]
     int T_blocks, int n, int nx, int n0, int m,
-    const T* __restrict__ slack_weight_arr,  // [1]
-    bool use_slack, T* __restrict__ xi_g)
+    const T* __restrict__ slack_weight_arr,  // [Nb]
+    bool use_slack, T log_barrier_kappa, T* __restrict__ xi_g,
+    const uint32_t* __restrict__ status)
 {
     int bid = blockIdx.x;
     int tid = threadIdx.x;
@@ -175,9 +214,15 @@ __global__ void __launch_bounds__(768) postSolveKernel(
     int total_Tm = T_blocks * m;
     int total_Nnx = N * nx;
 
+    if (status[bid] != static_cast<uint32_t>(ADMM_STATUS_NOT_RUN)) {
+        for (int i = tid; i < total_tn; i += blockDim.x)
+            x[bid * total_tn + i] = x_old[bid * total_tn + i];
+        return;
+    }
+
     T rho_bar = rho_bar_arr[bid];
     T rho_f = rho_bar * rho_f_factor;
-    T slack_weight = slack_weight_arr[0];
+    T slack_weight = slack_weight_arr[bid];
 
     // Batch offsets
     int off_tn  = bid * total_tn;
@@ -201,18 +246,26 @@ __global__ void __launch_bounds__(768) postSolveKernel(
     // Step 2: Over-relaxation — shared with fused kernel
     overRelaxDevice(x + off_tn, x_old + off_tn, alpha_relax, total_tn);
 
-    // Step 3: Save z_g_old, then slack update — shared with fused kernel
+    // Step 3: Save z_g_old, then the inequality proximal
     if (m > 0) {
         for (int i = tid; i < total_Tm; i += blockDim.x)
             z_g_old[off_Tm + i] = z_g[off_Tm + i];
     }
     __syncthreads();
 
-    slackUpdateDevice(
-        z_g + off_Tm, Gx + off_Tm, y_g + off_Tm,
-        l_g + bid * total_Tm, u_g + bid * total_Tm,
-        alpha_relax, rho_bar, T_blocks, m,
-        slack_weight, use_slack, xi_g + off_Tm);
+    if constexpr (Handling == ConstraintHandling::LogBarrier) {
+        logBarrierUpdateDevice(
+            z_g + off_Tm, Gx + off_Tm, y_g + off_Tm,
+            l_g + bid * total_Tm, u_g + bid * total_Tm,
+            alpha_relax, rho_bar, T_blocks, m,
+            log_barrier_kappa, slack_weight, use_slack, xi_g + off_Tm);
+    } else {
+        projectionUpdateDevice(
+            z_g + off_Tm, Gx + off_Tm, y_g + off_Tm,
+            l_g + bid * total_Tm, u_g + bid * total_Tm,
+            alpha_relax, rho_bar, T_blocks, m,
+            slack_weight, use_slack, xi_g + off_Tm);
+    }
 
     // Step 4: Dual update — shared with fused kernel
     dualUpdateDevice(
@@ -224,16 +277,17 @@ __global__ void __launch_bounds__(768) postSolveKernel(
         T_blocks, n, nx, n0, m);
 }
 
-// ---- Kernel 4: compute residuals + norm terms ----
+// ---- Kernel 4: compute residuals and norm terms ----
 // Uses shared memory for block reductions (inf-norm).
 // Writes per-batch: residuals_out[bid*4+0] = primal_residual
 //                   residuals_out[bid*4+1] = dual_residual
 //                   residuals_out[bid*4+2] = primal_norm_term
 //                   residuals_out[bid*4+3] = dual_norm_term
-// Norm terms match JAX _compute_residuals (admm.py:267-336) for eps_rel scaling.
+// Norm terms match JAX _compute_residuals for eps_rel scaling.
 template<typename T>
 __global__ void __launch_bounds__(768) computeResidualsKernel(
     T* __restrict__ residuals_out, // [Nb, 4]
+    uint32_t* __restrict__ finite_out, // [Nb]
     const T* __restrict__ x,
     const T* __restrict__ z_g,
     const T* __restrict__ y_g,
@@ -250,7 +304,8 @@ __global__ void __launch_bounds__(768) computeResidualsKernel(
     const T* __restrict__ cdyn_g,
     int T_blocks, int n, int nx, int n0, int m,
     const T* __restrict__ xi_g,
-    const T* __restrict__ slack_weight_arr,  // [1]
+    const T* __restrict__ rho_bar,
+    const T* __restrict__ slack_weight_arr,  // [Nb]
     bool use_slack)
 {
     extern __shared__ char smem_raw[];
@@ -266,7 +321,7 @@ __global__ void __launch_bounds__(768) computeResidualsKernel(
     int wid  = tid >> 5;
     int num_warps = (blockDim.x + 31) >> 5;
 
-    T slack_weight = slack_weight_arr[0];
+    T slack_weight = slack_weight_arr[bid];
 
     // Batch offsets
     int off_tn  = bid * total_tn;
@@ -282,6 +337,12 @@ __global__ void __launch_bounds__(768) computeResidualsKernel(
     int off_c0  = bid * n0;
     int off_cd  = bid * N * nx;
 
+    // Check state finiteness in parallel with residual evaluation.
+    if (tid == 0) finite_out[bid] = 1;
+    __syncthreads();
+    bool local_finite = true;
+    if (tid == 0) local_finite = local_finite && isfinite(rho_bar[bid]);
+
     // ---- Primal residual + norm term ----
     // primal_res = max(||Cx0-c0||, ||Cx_dyn-c_dyn||, ||Gx-z_g||)
     // primal_norm = max(||Cx0||, ||Cx_dyn||, ||c0||, ||c_dyn||, ||Gx||, ||z_g||)
@@ -290,6 +351,7 @@ __global__ void __launch_bounds__(768) computeResidualsKernel(
 
     // Cx0 - c0
     for (int j = tid; j < n0; j += blockDim.x) {
+        local_finite = local_finite && isfinite(y_f_0[off_n0 + j]);
         T sum = T(0);
         for (int k = 0; k < n; ++k)
             sum += A0_g[off_A0 + j * n + k] * x[off_tn + k];
@@ -302,6 +364,7 @@ __global__ void __launch_bounds__(768) computeResidualsKernel(
 
     // Cx_dyn - c_dyn
     for (int idx = tid; idx < total_Nnx; idx += blockDim.x) {
+        local_finite = local_finite && isfinite(y_f_dyn[off_Nnx + idx]);
         int t = idx / nx;
         int j = idx % nx;
         T sum = T(0);
@@ -321,6 +384,9 @@ __global__ void __launch_bounds__(768) computeResidualsKernel(
     // Gx - z_g
     if (m > 0) {
         for (int idx = tid; idx < total_Tm; idx += blockDim.x) {
+            local_finite = local_finite && isfinite(z_g[off_Tm + idx])
+                && isfinite(y_g[off_Tm + idx])
+                && isfinite(xi_g[off_Tm + idx]);
             int t = idx / m;
             int j = idx % m;
             T sum = T(0);
@@ -377,6 +443,7 @@ __global__ void __launch_bounds__(768) computeResidualsKernel(
     T local_dual_norm = T(0);
 
     for (int idx = tid; idx < total_tn; idx += blockDim.x) {
+        local_finite = local_finite && isfinite(x[off_tn + idx]);
         int t = idx / n;
         int j = idx % n;
 
@@ -517,6 +584,7 @@ __global__ void __launch_bounds__(768) computeResidualsKernel(
         }
     }
 
+    if (!local_finite) atomicExch(finite_out + bid, uint32_t(0));
     if (tid == 0) {
         residuals_out[bid * 4 + 0] = primal_res;
         residuals_out[bid * 4 + 1] = dual_res;
@@ -525,34 +593,103 @@ __global__ void __launch_bounds__(768) computeResidualsKernel(
     }
 }
 
-// ---- Kernel 4b: check convergence and signal host via mapped memory ----
-// Runs as <<<1, 1>>> after computeResidualsKernel on the same stream.
-// Reads the [Nb, 2] residual buffer, checks if ALL batch elements converged,
-// and writes the converged iteration to mapped host memory.
-// __threadfence_system() ensures the write is visible to the CPU immediately.
+template<typename T>
+__global__ void computeInfeasibilityMetricsKernel(
+    T* metrics,
+    const T* x, const T* yg, const T* yf0, const T* yfdyn, const T* xi,
+    const T* previous_x, const T* previous_yg,
+    const T* previous_yf0, const T* previous_yfdyn, const T* previous_xi,
+    const T* D, const T* E, const T* q,
+    const T* A0, const T* Am, const T* Ap, const T* G,
+    const T* lower, const T* upper, const T* c0, const T* cdyn,
+    const T* slack_weight, bool use_slack,
+    int Tn, int n, int nx, int n0, int m)
+{
+    int batch = blockIdx.x;
+    int N = Tn - 1;
+    int tn = Tn * n;
+    int tm = Tn * m;
+    int ndyn = N * nx;
+    extern __shared__ unsigned char shared_bytes[];
+    T* warp_buffer = reinterpret_cast<T*>(shared_bytes);
+    ComputeADMMInfeasibilityMetrics(
+        metrics + batch * 7,
+        x + batch * tn, yg + batch * tm, yf0 + batch * n0,
+        yfdyn + batch * ndyn, xi + batch * tm,
+        previous_x + batch * tn, previous_yg + batch * tm,
+        previous_yf0 + batch * n0, previous_yfdyn + batch * ndyn,
+        previous_xi + batch * tm,
+        D + batch * Tn * n * n, E + batch * N * n * n,
+        q + batch * tn, A0 + batch * n0 * n,
+        Am + batch * N * nx * n, Ap + batch * N * nx * n,
+        G + batch * Tn * m * n, lower + batch * tm, upper + batch * tm,
+        c0 + batch * n0, cdyn + batch * ndyn,
+        slack_weight[batch], use_slack, Tn, n, nx, n0, m, warp_buffer);
+}
+
+// Select statuses and signal the host when the native loop must stop.
 template<typename T>
 __global__ void checkConvergenceSignalKernel(
-    const T* __restrict__ residuals,  // [Nb, 4]
+    const T* __restrict__ residuals,
+    const T* __restrict__ metrics,
+    const uint32_t* __restrict__ finite_flags,
+    uint32_t* __restrict__ status_out,
+    uint32_t* __restrict__ iterations_out,
+    T* __restrict__ terminal_residuals,
     volatile int* converged_flag,     // mapped memory (host-visible)
     T eps_abs,
     T eps_rel,
+    T eps_prim_inf,
+    T eps_dual_inf,
     int Nb,
-    int current_iter)
+    int current_iter,
+    bool check_termination,
+    bool check_infeasibility,
+    bool iteration_limit_reached)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    bool all_finished = true;
     for (int b = 0; b < Nb; ++b) {
+        if (status_out[b] != static_cast<uint32_t>(ADMM_STATUS_NOT_RUN)) continue;
         T p_res  = residuals[b * 4 + 0];
         T d_res  = residuals[b * 4 + 1];
         T p_norm = residuals[b * 4 + 2];
         T d_norm = residuals[b * 4 + 3];
         T p_tol  = eps_abs + eps_rel * p_norm;
         T d_tol  = eps_abs + eps_rel * d_norm;
-        if (!(p_res < p_tol && d_res < d_tol))
-            return;  // not all converged
+        const T* certificate = metrics + b * 7;
+        T direction_floor = T(10) * (
+            sizeof(T) == sizeof(float) ? T(FLT_EPSILON) : T(DBL_EPSILON));
+        bool finite = finite_flags[b] != 0
+            && isfinite(p_res) && isfinite(d_res)
+            && isfinite(p_norm) && isfinite(d_norm);
+        bool solved = check_termination && finite
+            && p_res <= p_tol && d_res <= d_tol;
+        bool primal_infeasible = check_infeasibility
+            && certificate[0] > direction_floor
+            && certificate[1] <= eps_prim_inf * certificate[0]
+            && certificate[2] <= -eps_prim_inf * certificate[0];
+        bool dual_infeasible = check_infeasibility
+            && certificate[3] > direction_floor
+            && certificate[4] <= eps_dual_inf * certificate[3]
+            && certificate[5] <= -eps_dual_inf * certificate[3]
+            && certificate[6] <= eps_dual_inf * certificate[3];
+        int32_t status = SelectADMMStatus(
+            !finite, solved, primal_infeasible, dual_infeasible,
+            iteration_limit_reached);
+        status_out[b] = static_cast<uint32_t>(status);
+        if (status != ADMM_STATUS_NOT_RUN)
+            iterations_out[b] = static_cast<uint32_t>(current_iter);
+        terminal_residuals[b * 4] = p_res;
+        terminal_residuals[b * 4 + 1] = d_res;
+        terminal_residuals[b * 4 + 2] = p_tol;
+        terminal_residuals[b * 4 + 3] = d_tol;
+        all_finished = all_finished && status != ADMM_STATUS_NOT_RUN;
     }
-    // All batch elements converged — signal host
-    *converged_flag = current_iter;
-    __threadfence_system();
+    if (all_finished) {
+        *converged_flag = current_iter;
+        __threadfence_system();
+    }
 }
 
 // ---- Kernel 4c: OSQP-style adaptive rho update ----
@@ -566,11 +703,12 @@ __global__ void rhoUpdateKernel(
     T* __restrict__ rho_bar_work,             // [Nb] in/out
     volatile int* changed_flag,               // mapped memory: 0 = no change,
                                               //                1 = at least one bid updated rho
-    T rho_min, T rho_max, T tolerance,
-    int Nb)
+    T max_factor, T rho_min, T rho_max, T tolerance,
+    int Nb, const uint32_t* __restrict__ status)
 {
     int bid = blockIdx.x * blockDim.x + threadIdx.x;
     if (bid >= Nb) return;
+    if (status[bid] != static_cast<uint32_t>(ADMM_STATUS_NOT_RUN)) return;
 
     T p_res  = residuals[bid * 4 + 0];
     T d_res  = residuals[bid * 4 + 1];
@@ -587,7 +725,7 @@ __global__ void rhoUpdateKernel(
     T rho_new;
     bool should_update = computeRhoCandidateDevice<T>(
         p_normalized, d_normalized, rho_old,
-        rho_min, rho_max, tolerance, &rho_new);
+        max_factor, rho_min, rho_max, tolerance, &rho_new);
 
     if (should_update) {
         rho_bar_work[bid] = rho_new;
@@ -646,7 +784,6 @@ __global__ void recomputeSKernel(
 // ---- Kernel 5: copy outputs ----
 template<typename T>
 __global__ void copyOutputsKernel(
-    T*        __restrict__ x_out,
     uint32_t* __restrict__ iters_out,
     T*        __restrict__ x_blocks_out,
     T*        __restrict__ z_g_out,
@@ -669,7 +806,6 @@ __global__ void copyOutputsKernel(
     int tid = threadIdx.x;
 
     for (int i = tid; i < total_tn; i += blockDim.x) {
-        x_out[bid * total_tn + i] = x[bid * total_tn + i];
         x_blocks_out[bid * total_tn + i] = x[bid * total_tn + i];
     }
     for (int i = tid; i < total_Tm; i += blockDim.x)
@@ -690,13 +826,14 @@ __global__ void copyOutputsKernel(
 
 
 // ============================================================
-// Persistent cache for cuDSS plan + scratch buffers.
-// Eliminates per-call overhead of handle creation, analysis,
-// CSR structure assembly, and buffer allocation.
-// Same pattern as cudss_blktridi.cu's g_cache.
+// Python-owned cuDSS workspace.
 // ============================================================
 
-struct ADMMCudssCache {
+struct AdmmCudssWorkspace {
+    turbompc::FfiDeviceAllocator cudss_allocator{};
+    int32_t Nb = 0, T = 0, n = 0, nx = 0, n0 = 0, m = 0;
+    int32_t dtype_bytes = 0;
+    bool initialized = false;
     // cuDSS objects (persistent)
     cudssHandle_t handle = nullptr;
     cudssConfig_t config = nullptr;
@@ -724,6 +861,12 @@ struct ADMMCudssCache {
     void* d_Cx_dyn = nullptr;
     void* d_z_g_old = nullptr;
     void* d_residuals = nullptr;
+    uint32_t* d_finite_flags = nullptr;
+    void* d_infeasibility_metrics = nullptr;
+    void* d_previous_y_g = nullptr;
+    void* d_previous_y_f_0 = nullptr;
+    void* d_previous_y_f_dyn = nullptr;
+    void* d_previous_xi_g = nullptr;
     uint32_t* d_iter_counts = nullptr;
 
     // Adaptive-rho workspaces (mutated in-loop; initialised from inputs each call).
@@ -741,122 +884,271 @@ struct ADMMCudssCache {
 
     bool analysis_done = false;
     bool structure_written = false;
+    cudaEvent_t completion_event = nullptr;
 
     std::mutex entry_mutex;  // per-entry lock for exclusive access
 
-    ADMMCudssCache() = default;
+    AdmmCudssWorkspace() = default;
 
-    ADMMCudssCache(ADMMCudssCache&& o) noexcept
-        : handle(o.handle), config(o.config), data(o.data),
-          matA(o.matA), matX(o.matX), matB(o.matB),
-          csr_indptr(o.csr_indptr), csr_indices(o.csr_indices), csr_data(o.csr_data),
-          d_x(o.d_x), d_z_g(o.d_z_g), d_y_g(o.d_y_g),
-          d_y_f_0(o.d_y_f_0), d_y_f_dyn(o.d_y_f_dyn), d_xi_g(o.d_xi_g),
-          d_gamma(o.d_gamma), d_x_old(o.d_x_old), d_Gx(o.d_Gx),
-          d_Cx0(o.d_Cx0), d_Cx_dyn(o.d_Cx_dyn), d_z_g_old(o.d_z_g_old),
-          d_residuals(o.d_residuals), d_iter_counts(o.d_iter_counts),
-          d_S_work(o.d_S_work), d_rho_bar_work(o.d_rho_bar_work),
-          d_theta_inv_work(o.d_theta_inv_work),
-          h_converged_flag(o.h_converged_flag), d_converged_flag(o.d_converged_flag),
-          h_rho_changed_flag(o.h_rho_changed_flag),
-          d_rho_changed_flag(o.d_rho_changed_flag),
-          analysis_done(o.analysis_done), structure_written(o.structure_written)
-    {
-        o.handle = nullptr; o.config = nullptr; o.data = nullptr;
-        o.matA = nullptr; o.matX = nullptr; o.matB = nullptr;
-        o.csr_indptr = nullptr; o.csr_indices = nullptr; o.csr_data = nullptr;
-        o.d_x = nullptr; o.d_z_g = nullptr; o.d_y_g = nullptr;
-        o.d_y_f_0 = nullptr; o.d_y_f_dyn = nullptr; o.d_xi_g = nullptr;
-        o.d_gamma = nullptr; o.d_x_old = nullptr; o.d_Gx = nullptr;
-        o.d_Cx0 = nullptr; o.d_Cx_dyn = nullptr; o.d_z_g_old = nullptr;
-        o.d_residuals = nullptr; o.d_iter_counts = nullptr;
-        o.d_S_work = nullptr; o.d_rho_bar_work = nullptr;
-        o.d_theta_inv_work = nullptr;
-        o.h_converged_flag = nullptr; o.d_converged_flag = nullptr;
-        o.h_rho_changed_flag = nullptr; o.d_rho_changed_flag = nullptr;
-    }
+    AdmmCudssWorkspace(const AdmmCudssWorkspace&) = delete;
+    AdmmCudssWorkspace& operator=(const AdmmCudssWorkspace&) = delete;
+    AdmmCudssWorkspace& operator=(AdmmCudssWorkspace&&) = delete;
 
-    ADMMCudssCache(const ADMMCudssCache&) = delete;
-    ADMMCudssCache& operator=(const ADMMCudssCache&) = delete;
-    ADMMCudssCache& operator=(ADMMCudssCache&&) = delete;
-
-    // Destructor: free every resource the move-constructor nullifies.
-    // Must be noexcept (called from std::unordered_map). Errors during
-    // teardown are non-fatal — we log to stderr and continue.
-    ~ADMMCudssCache() noexcept {
-        // cuDSS objects (must be destroyed before the handle)
+    void release_capacity(turbompc::FfiDeviceAllocator& allocator) {
+        if (completion_event) cudaEventSynchronize(completion_event);
+        cudss_allocator = allocator;
         if (matA) cudssMatrixDestroy(matA);
         if (matX) cudssMatrixDestroy(matX);
         if (matB) cudssMatrixDestroy(matB);
         if (data && handle) cudssDataDestroy(handle, data);
         if (config) cudssConfigDestroy(config);
         if (handle) cudssDestroy(handle);
-
-        // Device buffers
-        if (csr_indptr)      cudaFree(csr_indptr);
-        if (csr_indices)     cudaFree(csr_indices);
-        if (csr_data)        cudaFree(csr_data);
-        if (d_x)             cudaFree(d_x);
-        if (d_z_g)           cudaFree(d_z_g);
-        if (d_y_g)           cudaFree(d_y_g);
-        if (d_y_f_0)         cudaFree(d_y_f_0);
-        if (d_y_f_dyn)       cudaFree(d_y_f_dyn);
-        if (d_xi_g)          cudaFree(d_xi_g);
-        if (d_gamma)         cudaFree(d_gamma);
-        if (d_x_old)         cudaFree(d_x_old);
-        if (d_Gx)            cudaFree(d_Gx);
-        if (d_Cx0)           cudaFree(d_Cx0);
-        if (d_Cx_dyn)        cudaFree(d_Cx_dyn);
-        if (d_z_g_old)       cudaFree(d_z_g_old);
-        if (d_residuals)     cudaFree(d_residuals);
-        if (d_iter_counts)   cudaFree(d_iter_counts);
-        if (d_S_work)        cudaFree(d_S_work);
-        if (d_rho_bar_work)  cudaFree(d_rho_bar_work);
-        if (d_theta_inv_work) cudaFree(d_theta_inv_work);
+        const size_t scalar_size = static_cast<size_t>(dtype_bytes);
+        const size_t total_tn = static_cast<size_t>(T) * n;
+        const size_t total_Tm = static_cast<size_t>(T) * m;
+        const size_t total_Nnx = static_cast<size_t>(T - 1) * nx;
+        const size_t total = static_cast<size_t>(Nb) * total_tn;
+        const size_t nnz_per_sys = T == 1
+            ? static_cast<size_t>(n) * n
+            : static_cast<size_t>(3 * T - 2) * n * n;
+        const size_t nnz = static_cast<size_t>(Nb) * nnz_per_sys;
+        auto free = [&](void* pointer, size_t bytes) {
+            if (pointer) turbompc::FfiFree(allocator, pointer, bytes);
+        };
+        free(csr_indptr, (total + 1) * sizeof(int32_t));
+        free(csr_indices, nnz * sizeof(int32_t));
+        free(csr_data, nnz * scalar_size);
+        free(d_x, static_cast<size_t>(Nb) * total_tn * scalar_size);
+        free(d_z_g, static_cast<size_t>(Nb) * total_Tm * scalar_size);
+        free(d_y_g, static_cast<size_t>(Nb) * total_Tm * scalar_size);
+        free(d_y_f_0, static_cast<size_t>(Nb) * n0 * scalar_size);
+        free(d_y_f_dyn, static_cast<size_t>(Nb) * total_Nnx * scalar_size);
+        free(d_xi_g, static_cast<size_t>(Nb) * total_Tm * scalar_size);
+        free(d_gamma, static_cast<size_t>(Nb) * total_tn * scalar_size);
+        free(d_x_old, static_cast<size_t>(Nb) * total_tn * scalar_size);
+        free(d_Gx, static_cast<size_t>(Nb) * total_Tm * scalar_size);
+        free(d_Cx0, static_cast<size_t>(Nb) * n0 * scalar_size);
+        free(d_Cx_dyn, static_cast<size_t>(Nb) * total_Nnx * scalar_size);
+        free(d_z_g_old, static_cast<size_t>(Nb) * total_Tm * scalar_size);
+        free(d_residuals, static_cast<size_t>(Nb) * 4 * scalar_size);
+        free(d_finite_flags, static_cast<size_t>(Nb) * sizeof(uint32_t));
+        free(d_infeasibility_metrics, static_cast<size_t>(Nb) * 7 * scalar_size);
+        free(d_previous_y_g, static_cast<size_t>(Nb) * total_Tm * scalar_size);
+        free(d_previous_y_f_0, static_cast<size_t>(Nb) * n0 * scalar_size);
+        free(d_previous_y_f_dyn, static_cast<size_t>(Nb) * total_Nnx * scalar_size);
+        free(d_previous_xi_g, static_cast<size_t>(Nb) * total_Tm * scalar_size);
+        free(d_iter_counts, static_cast<size_t>(Nb) * sizeof(uint32_t));
+        free(d_S_work, static_cast<size_t>(Nb) * T * n * 3 * n * scalar_size);
+        free(d_rho_bar_work, static_cast<size_t>(Nb) * scalar_size);
+        free(d_theta_inv_work, static_cast<size_t>(Nb) * T * n * n * scalar_size);
 
         // Mapped host memory (h_* and d_* point to the same underlying region;
         // free once via cudaFreeHost on the host pointer).
         if (h_converged_flag)   cudaFreeHost((void*)h_converged_flag);
         if (h_rho_changed_flag) cudaFreeHost((void*)h_rho_changed_flag);
+
+        handle = nullptr;
+        config = nullptr;
+        data = nullptr;
+        matA = nullptr;
+        matX = nullptr;
+        matB = nullptr;
+        csr_indptr = nullptr;
+        csr_indices = nullptr;
+        csr_data = nullptr;
+        d_x = d_z_g = d_y_g = d_y_f_0 = d_y_f_dyn = nullptr;
+        d_xi_g = d_gamma = d_x_old = d_Gx = d_Cx0 = d_Cx_dyn = nullptr;
+        d_z_g_old = d_residuals = d_infeasibility_metrics = nullptr;
+        d_previous_y_g = d_previous_y_f_0 = d_previous_y_f_dyn = nullptr;
+        d_previous_xi_g = d_S_work = d_rho_bar_work = d_theta_inv_work = nullptr;
+        d_finite_flags = d_iter_counts = nullptr;
+        h_converged_flag = h_rho_changed_flag = nullptr;
+        d_converged_flag = d_rho_changed_flag = nullptr;
+        initialized = false;
+        analysis_done = false;
+        structure_written = false;
+        Nb = T = n = nx = n0 = m = dtype_bytes = 0;
     }
+
+    ~AdmmCudssWorkspace() noexcept = default;
 };
 
-static std::mutex g_admm_cache_mutex;
-static std::unordered_map<uint64_t, ADMMCudssCache> g_admm_cache;
+static std::mutex g_workspace_registry_mutex;
+static std::unordered_map<uint64_t, std::unique_ptr<AdmmCudssWorkspace>> g_workspace_registry;
+static uint64_t g_next_workspace_handle = 1;
+static thread_local std::string g_last_error;
 
-// ---------------------------------------------------------------------------
-// Cache control entry points (callable from Python via ctypes — NOT FFI).
-//   ClearADMMCudssCacheImpl(): drop all entries (their destructors release
-//                              cuDSS handles + cudaMalloc'd buffers).
-//   ADMMCudssCacheSize():      number of live entries (debug/test helper).
-// ---------------------------------------------------------------------------
-extern "C" void ClearADMMCudssCacheImpl() {
-    std::lock_guard<std::mutex> lock(g_admm_cache_mutex);
-    g_admm_cache.clear();
+uint64_t CreateAdmmCudssWorkspace() {
+    try {
+        auto workspace = std::make_unique<AdmmCudssWorkspace>();
+        std::lock_guard<std::mutex> lock(g_workspace_registry_mutex);
+        const uint64_t handle = g_next_workspace_handle++;
+        g_workspace_registry.emplace(handle, std::move(workspace));
+        return handle;
+    } catch (const std::exception& error) {
+        g_last_error = error.what();
+        return 0;
+    }
 }
 
-extern "C" int ADMMCudssCacheSize() {
-    std::lock_guard<std::mutex> lock(g_admm_cache_mutex);
-    return static_cast<int>(g_admm_cache.size());
+int DestroyAdmmCudssWorkspace(turbompc::FfiDeviceAllocator& allocator, uint64_t handle) {
+    try {
+        std::unique_ptr<AdmmCudssWorkspace> workspace;
+        std::unique_lock<std::mutex> registry_lock(g_workspace_registry_mutex);
+        auto position = g_workspace_registry.find(handle);
+        if (position == g_workspace_registry.end())
+            throw std::invalid_argument("ADMM cuDSS workspace handle is not live");
+        std::unique_lock<std::mutex> execution_lock(position->second->entry_mutex);
+        workspace = std::move(position->second);
+        g_workspace_registry.erase(position);
+        registry_lock.unlock();
+        execution_lock.unlock();
+        workspace->release_capacity(allocator);
+        if (workspace->completion_event) cudaEventDestroy(workspace->completion_event);
+        workspace.reset();
+        return 0;
+    } catch (const std::exception& error) {
+        g_last_error = error.what();
+        return -1;
+    }
 }
 
-static uint64_t admmCacheKey(int32_t Nb, int32_t T, int32_t n,
-                             int32_t nx, int32_t n0, int32_t m,
-                             int dtype_bytes) {
-    return ((uint64_t)(uint32_t)Nb << 48) | ((uint64_t)(uint32_t)T << 36) |
-           ((uint64_t)(uint32_t)n  << 28) | ((uint64_t)(uint32_t)nx << 20) |
-           ((uint64_t)(uint32_t)n0 << 12) | ((uint64_t)(uint32_t)m  << 4)  |
-           (uint64_t)(uint32_t)dtype_bytes;
+const char* AdmmCudssLastError() {
+    return g_last_error.c_str();
 }
 
+template<typename T>
+static void ensureWorkspaceCapacity(turbompc::FfiDeviceAllocator& allocator,
+                                    AdmmCudssWorkspace* entry, int32_t Nb,
+                                    int32_t T_blocks, int32_t n, int32_t nx,
+                                    int32_t n0, int32_t m) {
+    if (Nb < 1 || T_blocks < 1 || n < 1 || nx < 1 || n0 < 0 || m < 0)
+        throw std::invalid_argument("invalid ADMM cuDSS workspace dimensions");
+
+    if (entry->initialized && entry->Nb == Nb && entry->T == T_blocks &&
+        entry->n == n && entry->nx == nx && entry->n0 == n0 &&
+        entry->m == m && entry->dtype_bytes == sizeof(T))
+        return;
+
+    entry->release_capacity(allocator);
+    if (!entry->completion_event) {
+        CUDA_CHECK_THROW(cudaEventCreateWithFlags(&entry->completion_event, cudaEventDisableTiming));
+        CUDA_CHECK_THROW(cudaEventRecord(entry->completion_event, nullptr));
+    }
+    entry->Nb = Nb;
+    entry->T = T_blocks;
+    entry->n = n;
+    entry->nx = nx;
+    entry->n0 = n0;
+    entry->m = m;
+    entry->dtype_bytes = sizeof(T);
+
+    const int N = T_blocks - 1;
+    const int total_tn = T_blocks * n;
+    const int total_Tm = T_blocks * m;
+    const int total_Nnx = N * nx;
+    const int total = Nb * total_tn;
+    const size_t nnz_per_sys = (T_blocks == 1)
+        ? (size_t)n * n
+        : (size_t)(3 * T_blocks - 2) * n * n;
+    const size_t nnz = (size_t)Nb * nnz_per_sys;
+    const cudaDataType_t valueType = std::is_same_v<T, float>
+        ? CUDSS_R_32F : CUDSS_R_64F;
+
+    turbompc::FfiAllocate(allocator, &entry->d_x, (size_t)Nb * total_tn * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->d_z_g, (size_t)Nb * total_Tm * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->d_y_g, (size_t)Nb * total_Tm * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->d_y_f_0, (size_t)Nb * n0 * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->d_y_f_dyn, (size_t)Nb * total_Nnx * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->d_xi_g, (size_t)Nb * total_Tm * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->d_gamma, (size_t)Nb * total_tn * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->d_x_old, (size_t)Nb * total_tn * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->d_Gx, (size_t)Nb * total_Tm * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->d_Cx0, (size_t)Nb * n0 * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->d_Cx_dyn, (size_t)Nb * total_Nnx * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->d_z_g_old, (size_t)Nb * total_Tm * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->d_residuals, (size_t)Nb * 4 * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->d_finite_flags, (size_t)Nb * sizeof(uint32_t));
+    turbompc::FfiAllocate(allocator, &entry->d_infeasibility_metrics, (size_t)Nb * 7 * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->d_previous_y_g, (size_t)Nb * total_Tm * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->d_previous_y_f_0, (size_t)Nb * n0 * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->d_previous_y_f_dyn, (size_t)Nb * total_Nnx * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->d_previous_xi_g, (size_t)Nb * total_Tm * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->d_iter_counts, (size_t)Nb * sizeof(uint32_t));
+    turbompc::FfiAllocate(allocator, &entry->d_S_work, (size_t)Nb * T_blocks * n * 3 * n * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->d_rho_bar_work, (size_t)Nb * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->d_theta_inv_work, (size_t)Nb * T_blocks * n * n * sizeof(T));
+    turbompc::FfiAllocate(allocator, &entry->csr_indptr, (total + 1) * sizeof(int32_t));
+    turbompc::FfiAllocate(allocator, &entry->csr_indices, nnz * sizeof(int32_t));
+    turbompc::FfiAllocate(allocator, &entry->csr_data, nnz * sizeof(T));
+
+    CUDA_CHECK_THROW(cudaHostAlloc((void**)&entry->h_converged_flag, sizeof(int),
+                                   cudaHostAllocMapped));
+    CUDA_CHECK_THROW(cudaHostGetDevicePointer(&entry->d_converged_flag,
+                                               (int*)entry->h_converged_flag, 0));
+    CUDA_CHECK_THROW(cudaHostAlloc((void**)&entry->h_rho_changed_flag, sizeof(int),
+                                   cudaHostAllocMapped));
+    CUDA_CHECK_THROW(cudaHostGetDevicePointer(&entry->d_rho_changed_flag,
+                                               (int*)entry->h_rho_changed_flag, 0));
+
+    CUDSS_CHECK(cudssCreate(&entry->handle));
+    entry->cudss_allocator = allocator;
+    CUDSS_CHECK(turbompc::SetCudssDeviceMemory(entry->handle,
+                                               entry->cudss_allocator));
+    CUDSS_CHECK(cudssConfigCreate(&entry->config));
+    CUDSS_CHECK(cudssDataCreate(entry->handle, &entry->data));
+    cudssReorderingAlg_t reorder_alg = CUDSS_REORDERING_ALG_DEFAULT;
+    CUDSS_CHECK(cudssConfigSet(entry->config, CUDSS_CONFIG_REORDERING_ALG,
+                               &reorder_alg, sizeof(reorder_alg)));
+    // cuDSS >= 1.0 enables matching by default; the regularized KKT does not need it.
+    cudssMatchingAlg_t matching_alg = CUDSS_MATCHING_ALG_NONE;
+    CUDSS_CHECK(cudssConfigSet(entry->config, CUDSS_CONFIG_MATCHING_ALG,
+                               &matching_alg, sizeof(matching_alg)));
+    CUDSS_CHECK(cudssMatrixCreateCsr(
+        &entry->matA, total, total, nnz, entry->csr_indptr, nullptr,
+        entry->csr_indices, (T*)entry->csr_data, CUDSS_R_32I, CUDSS_R_32I,
+        valueType, CUDSS_MTYPE_GENERAL, CUDSS_MVIEW_FULL, CUDSS_BASE_ZERO));
+    CUDSS_CHECK(cudssMatrixCreateDn(&entry->matX, total, 1, total,
+                                    (T*)entry->d_x, valueType,
+                                    CUDSS_LAYOUT_COL_MAJOR));
+    CUDSS_CHECK(cudssMatrixCreateDn(&entry->matB, total, 1, total,
+                                    (T*)entry->d_gamma, valueType,
+                                    CUDSS_LAYOUT_COL_MAJOR));
+    entry->initialized = true;
+}
+
+int EnsureAdmmCudssWorkspaceCapacity(
+    turbompc::FfiDeviceAllocator& allocator, uint64_t workspace_handle, int32_t Nb, int32_t T, int32_t n,
+    int32_t nx, int32_t n0, int32_t m, int32_t dtype_bytes) {
+    try {
+        std::unique_lock<std::mutex> registry_lock(g_workspace_registry_mutex);
+        auto position = g_workspace_registry.find(workspace_handle);
+        if (position == g_workspace_registry.end())
+            throw std::invalid_argument("ADMM cuDSS workspace handle is not live");
+        AdmmCudssWorkspace* entry = position->second.get();
+        std::unique_lock<std::mutex> entry_lock(entry->entry_mutex);
+        registry_lock.unlock();
+        if (dtype_bytes == 4)
+            ensureWorkspaceCapacity<float>(allocator, entry, Nb, T, n, nx, n0, m);
+        else if (dtype_bytes == 8)
+            ensureWorkspaceCapacity<double>(allocator, entry, Nb, T, n, nx, n0, m);
+        else
+            throw std::invalid_argument("workspace dtype must be 4 or 8 bytes");
+        return 0;
+    } catch (const std::exception& error) {
+        g_last_error = error.what();
+        return -1;
+    }
+}
 
 template<typename T>
 static void launchADMMCudss(
+    turbompc::FfiDeviceAllocator& allocator, uint64_t workspace_handle,
     cudaStream_t stream,
-    T* x_out, uint32_t* iters_out,
+    uint32_t* iters_out,
     T* x_blocks_out, T* z_g_out, T* y_g_out,
     T* y_f_0_out, T* y_f_dyn_out, T* xi_g_out, T* rho_bar_out,
-    T* kernel_ns_out,
+    T* kernel_ns_out, uint32_t* status_out, T* terminal_residuals_out,
     const T* S, const T* D, const T* E, const T* q,
     const T* A0, const T* A_minus, const T* A_plus, const T* G,
     const T* l_bounds, const T* u_bounds, const T* c0, const T* c_dyn,
@@ -871,7 +1163,6 @@ static void launchADMMCudss(
     int total_tn  = T_blocks * n;
     int total_Tm  = T_blocks * m;
     int total_Nnx = N * nx;
-    int total     = Nb * T_blocks * n;
 
     // Thread count for kernels
     int max_elem = total_tn;
@@ -884,87 +1175,21 @@ static void launchADMMCudss(
     // threads than elements is correct.
     if (threads > 768) threads = 768;
 
-    size_t nnz_per_sys = (T_blocks == 1) ? (size_t)n * n : (size_t)(3 * T_blocks - 2) * n * n;
-    size_t nnz = (size_t)Nb * nnz_per_sys;
-    cudssDataType_t valueType = std::is_same_v<T, float> ? CUDSS_R_32F : CUDSS_R_64F;
-
-    // ---- Cache lookup / create ----
-    uint64_t key = admmCacheKey(Nb, T_blocks, n, nx, n0, m, sizeof(T));
-    ADMMCudssCache* entry = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_admm_cache_mutex);
-        auto it = g_admm_cache.find(key);
-        if (it == g_admm_cache.end()) {
-            ADMMCudssCache e{};
-
-            // Persistent scratch buffers (cudaMalloc, not async — survives across calls)
-            cudaMalloc(&e.d_x,           (size_t)Nb * total_tn  * sizeof(T));
-            cudaMalloc(&e.d_z_g,         (size_t)Nb * total_Tm  * sizeof(T));
-            cudaMalloc(&e.d_y_g,         (size_t)Nb * total_Tm  * sizeof(T));
-            cudaMalloc(&e.d_y_f_0,       (size_t)Nb * n0        * sizeof(T));
-            cudaMalloc(&e.d_y_f_dyn,     (size_t)Nb * total_Nnx * sizeof(T));
-            cudaMalloc(&e.d_xi_g,        (size_t)Nb * total_Tm  * sizeof(T));
-            cudaMalloc(&e.d_gamma,       (size_t)Nb * total_tn  * sizeof(T));
-            cudaMalloc(&e.d_x_old,       (size_t)Nb * total_tn  * sizeof(T));
-            cudaMalloc(&e.d_Gx,          (size_t)Nb * total_Tm  * sizeof(T));
-            cudaMalloc(&e.d_Cx0,         (size_t)Nb * n0        * sizeof(T));
-            cudaMalloc(&e.d_Cx_dyn,      (size_t)Nb * total_Nnx * sizeof(T));
-            cudaMalloc(&e.d_z_g_old,     (size_t)Nb * total_Tm  * sizeof(T));
-            cudaMalloc(&e.d_residuals,   (size_t)Nb * 4         * sizeof(T));
-            cudaMalloc(&e.d_iter_counts, (size_t)Nb * sizeof(uint32_t));
-
-            // Adaptive-rho workspaces
-            cudaMalloc(&e.d_S_work,         (size_t)Nb * T_blocks * n * 3 * n * sizeof(T));
-            cudaMalloc(&e.d_rho_bar_work,   (size_t)Nb * sizeof(T));
-            cudaMalloc(&e.d_theta_inv_work, (size_t)Nb * T_blocks * n * n * sizeof(T));
-
-            // Persistent CSR buffers
-            cudaMalloc(&e.csr_indptr,  (total + 1) * sizeof(int32_t));
-            cudaMalloc(&e.csr_indices, nnz * sizeof(int32_t));
-            cudaMalloc(&e.csr_data,    nnz * sizeof(T));
-
-            // Mapped memory for zero-sync convergence signaling
-            cudaHostAlloc((void**)&e.h_converged_flag, sizeof(int), cudaHostAllocMapped);
-            cudaHostGetDevicePointer(&e.d_converged_flag, (int*)e.h_converged_flag, 0);
-
-            // Mapped memory for the rho-changed flag (adaptive rho)
-            cudaHostAlloc((void**)&e.h_rho_changed_flag, sizeof(int), cudaHostAllocMapped);
-            cudaHostGetDevicePointer(&e.d_rho_changed_flag, (int*)e.h_rho_changed_flag, 0);
-
-            // cuDSS handle + config (persistent)
-            CUDSS_CHECK(cudssCreate(&e.handle));
-            CUDSS_CHECK(cudssConfigCreate(&e.config));
-            CUDSS_CHECK(cudssDataCreate(e.handle, &e.data));
-
-            cudssReorderingAlg_t reorder_alg = CUDSS_REORDERING_ALG_DEFAULT;
-            CUDSS_CHECK(cudssConfigSet(e.config, CUDSS_CONFIG_REORDERING_ALG,
-                                       &reorder_alg, sizeof(reorder_alg)));
-
-            // Matrix descriptors: matX points directly to d_x (no separate buffer)
-            CUDSS_CHECK(cudssMatrixCreateCsr(
-                &e.matA, total, total, nnz,
-                e.csr_indptr, nullptr, e.csr_indices, (T*)e.csr_data,
-                CUDSS_R_32I, CUDSS_R_32I, valueType,
-                CUDSS_MTYPE_GENERAL, CUDSS_MVIEW_FULL, CUDSS_BASE_ZERO));
-            CUDSS_CHECK(cudssMatrixCreateDn(&e.matX, total, 1, total, (T*)e.d_x,
-                                            valueType, CUDSS_LAYOUT_COL_MAJOR));
-            CUDSS_CHECK(cudssMatrixCreateDn(&e.matB, total, 1, total, (T*)e.d_gamma,
-                                            valueType, CUDSS_LAYOUT_COL_MAJOR));
-
-            auto [ins, _] = g_admm_cache.emplace(key, std::move(e));
-            entry = &ins->second;
-        } else {
-            entry = &it->second;
-        }
-    }
-    // Global lock released — only hold per-entry lock below
-
-    std::lock_guard<std::mutex> entry_lock(entry->entry_mutex);
+    std::unique_lock<std::mutex> registry_lock(g_workspace_registry_mutex);
+    auto position = g_workspace_registry.find(workspace_handle);
+    if (position == g_workspace_registry.end())
+    throw std::invalid_argument("ADMM cuDSS workspace handle is not live");
+    AdmmCudssWorkspace* entry = position->second.get();
+    std::unique_lock<std::mutex> entry_lock(entry->entry_mutex);
+    registry_lock.unlock();
+    ensureWorkspaceCapacity<T>(allocator, entry, Nb, T_blocks, n, nx, n0, m);
+    CUDA_CHECK_THROW(cudaStreamWaitEvent(stream, entry->completion_event, 0));
 
     // Update stream (may change between calls)
+    entry->cudss_allocator = allocator;
     CUDSS_CHECK(cudssSetStream(entry->handle, stream));
 
-    // Cast cached void* to typed pointers
+    // Cast workspace-owned void* to typed pointers
     T* d_x        = (T*)entry->d_x;
     T* d_z_g      = (T*)entry->d_z_g;
     T* d_y_g      = (T*)entry->d_y_g;
@@ -978,16 +1203,15 @@ static void launchADMMCudss(
     T* d_Cx_dyn   = (T*)entry->d_Cx_dyn;
     T* d_z_g_old  = (T*)entry->d_z_g_old;
     T* d_residuals = (T*)entry->d_residuals;
+    uint32_t* d_finite_flags = entry->d_finite_flags;
+    T* d_infeasibility_metrics = (T*)entry->d_infeasibility_metrics;
+    T* d_previous_y_g = (T*)entry->d_previous_y_g;
+    T* d_previous_y_f_0 = (T*)entry->d_previous_y_f_0;
+    T* d_previous_y_f_dyn = (T*)entry->d_previous_y_f_dyn;
+    T* d_previous_xi_g = (T*)entry->d_previous_xi_g;
     uint32_t* d_iter_counts = entry->d_iter_counts;
     T* d_S_work       = (T*)entry->d_S_work;
     T* d_rho_bar_work = (T*)entry->d_rho_bar_work;
-
-    // Initialize iteration counts to max_iter
-    {
-        std::vector<uint32_t> h_iters(Nb, (uint32_t)cfg.max_iter);
-        cudaMemcpyAsync(d_iter_counts, h_iters.data(), Nb * sizeof(uint32_t),
-                        cudaMemcpyHostToDevice, stream);
-    }
 
     // ---- Stage inputs into writable workspaces ----
     // S → d_S_work, rho_bar_init → d_rho_bar_work. The body kernels and CSR
@@ -1004,7 +1228,8 @@ static void launchADMMCudss(
     initStateKernel<T><<<Nb, threads, 0, stream>>>(
         d_x, d_z_g, d_y_g, d_y_f_0, d_y_f_dyn, d_xi_g,
         x0, z_g0, y_g0, y_f_0_init, y_f_dyn_init, xi_g0,
-        total_tn, total_Tm, n0, total_Nnx);
+        total_tn, total_Tm, n0, total_Nnx,
+        status_out, d_iter_counts, cfg.max_iter);
 
     // ---- CSR assembly: full on first call, values-only on subsequent ----
     if (!entry->structure_written) {
@@ -1043,7 +1268,7 @@ static void launchADMMCudss(
         }
     }
 
-    // ---- cuDSS: analysis (cached) + factorization (per-call, S changes between SQP iters) ----
+  // ---- cuDSS: analysis (reused) + factorization (per-call, S changes between SQP iters) ----
     if (!entry->analysis_done) {
         CUDSS_CHECK(cudssExecute(entry->handle, CUDSS_PHASE_ANALYSIS, entry->config,
                                  entry->data, entry->matA, entry->matX, entry->matB));
@@ -1059,20 +1284,46 @@ static void launchADMMCudss(
     T alpha_k       = static_cast<T>(cfg.alpha);
     T eps_abs_k     = static_cast<T>(cfg.eps_abs);
     T eps_rel_k     = static_cast<T>(cfg.eps_rel);
+    T eps_prim_inf_k = static_cast<T>(cfg.eps_prim_inf);
+    T eps_dual_inf_k = static_cast<T>(cfg.eps_dual_inf);
     T rho_f_factor  = static_cast<T>(cfg.rho_f_factor);
     T rho_min_k     = static_cast<T>(cfg.rho_min);
     T rho_max_k     = static_cast<T>(cfg.rho_max);
     T rho_tol_k     = static_cast<T>(cfg.adaptive_rho_tolerance);
+    T rho_factor_k  = static_cast<T>(cfg.rho_update_max_factor);
+    T log_barrier_kappa_k = static_cast<T>(cfg.log_barrier_kappa);
 
-    int actual_iters = cfg.max_iter;
+    const bool log_barrier = cfg.constraint_handling == ConstraintHandling::LogBarrier;
+    // Both instantiations share one signature, so the selection is a pointer.
+    auto postSolve = log_barrier
+        ? postSolveKernel<T, ConstraintHandling::LogBarrier>
+        : postSolveKernel<T, ConstraintHandling::Projection>;
 
     for (int it = 0; it < cfg.max_iter; ++it) {
+        bool termination_check_fires =
+            (cfg.check_termination_every > 0
+             && ((it + 1) % cfg.check_termination_every == 0))
+            || it + 1 == cfg.max_iter;
+        // Hard-QP infeasibility certificates only apply to projection; a
+        // barrier solve reports SOLVED, MAX_ITER, or NONFINITE.
+        bool infeasibility_check_fires = !log_barrier
+            && ((cfg.check_infeasibility_every > 0
+                 && ((it + 1) % cfg.check_infeasibility_every == 0))
+                || it + 1 == cfg.max_iter);
+        bool rho_check_fires = cfg.adapt_rho_every > 0
+            && ((it + 1) % cfg.adapt_rho_every == 0);
+        if (infeasibility_check_fires) {
+            snapshotCertificateDualsKernel<T><<<Nb, threads, 0, stream>>>(
+                d_previous_y_g, d_previous_y_f_0, d_previous_y_f_dyn,
+                d_previous_xi_g, d_y_g, d_y_f_0, d_y_f_dyn, d_xi_g,
+                total_Tm, n0, total_Nnx);
+        }
         // 1. Compute gamma (RHS) and save x_old
         computeGammaAndSaveXOldKernel<T><<<Nb, threads, 0, stream>>>(
             d_gamma, d_x_old, d_x, d_z_g, d_y_g, d_y_f_0, d_y_f_dyn,
             q, A0, A_minus, A_plus, G, c0, c_dyn,
             sigma_k, rho_f_factor, d_rho_bar_work,
-            T_blocks, n, nx, n0, m);
+            T_blocks, n, nx, n0, m, status_out);
 
         // 2. cuDSS solve-only: S @ x_new = gamma
         //    matX points directly to d_x — solution lands in d_x, no D→D memcpy
@@ -1080,47 +1331,54 @@ static void launchADMMCudss(
         CUDSS_CHECK(cudssExecute(entry->handle, CUDSS_PHASE_SOLVE, entry->config,
                                  entry->data, entry->matA, entry->matX, entry->matB));
 
-        // 3. Post-solve: constraints + over-relax + slack + dual
-        postSolveKernel<T><<<Nb, threads, 0, stream>>>(
+        // 3. Post-solve: constraints + over-relax + inequality proximal + dual
+        postSolve<<<Nb, threads, 0, stream>>>(
             d_x, d_z_g, d_y_g, d_y_f_0, d_y_f_dyn,
             d_Gx, d_Cx0, d_Cx_dyn, d_z_g_old, d_x_old,
             A0, A_minus, A_plus, G, l_bounds, u_bounds, c0, c_dyn,
             alpha_k, rho_f_factor, d_rho_bar_work,
             T_blocks, n, nx, n0, m,
-            slack_weight_init, cfg.use_slack, d_xi_g);
+            slack_weight_init, cfg.use_slack, log_barrier_kappa_k, d_xi_g, status_out);
 
-        // 4. Convergence check (synchronous: peek mapped flag, break on hit)
-        bool conv_check_fires =
-            cfg.check_every > 0 && ((it + 1) % cfg.check_every == 0);
-        bool rho_check_fires =
-            cfg.adapt_rho_every > 0 && ((it + 1) % cfg.adapt_rho_every == 0);
-
-        // Both checks need residuals. If either fires, compute residuals once
-        // and reuse them for convergence detection (always first) and rho
-        // adaptation (only if not converged — otherwise the rho update would
-        // leak into rho_bar_out for an iterate that didn't use it).
-        if (conv_check_fires || rho_check_fires) {
+        // 4. Residual, status, infeasibility, and rho checks.
+        if (termination_check_fires || infeasibility_check_fires
+            || rho_check_fires) {
             size_t res_smem = ((threads + 31) / 32) * sizeof(T);
             computeResidualsKernel<T><<<Nb, threads, res_smem, stream>>>(
-                d_residuals, d_x, d_z_g, d_y_g, d_y_f_0, d_y_f_dyn,
+                d_residuals, d_finite_flags,
+                d_x, d_z_g, d_y_g, d_y_f_0, d_y_f_dyn,
                 D, E, q, A0, A_minus, A_plus, G, c0, c_dyn,
                 T_blocks, n, nx, n0, m,
-                d_xi_g, slack_weight_init, cfg.use_slack);
-
-            // Step 1: check convergence first (cheap, sets host-visible flag).
-            if (conv_check_fires) {
+                d_xi_g, d_rho_bar_work, slack_weight_init, cfg.use_slack);
+            if (infeasibility_check_fires) {
+                size_t certificate_smem = 7 * ((threads + 31) / 32) * sizeof(T);
+                computeInfeasibilityMetricsKernel<T><<<
+                    Nb, threads, certificate_smem, stream>>>(
+                    d_infeasibility_metrics,
+                    d_x, d_y_g, d_y_f_0, d_y_f_dyn, d_xi_g,
+                    d_x_old, d_previous_y_g, d_previous_y_f_0,
+                    d_previous_y_f_dyn, d_previous_xi_g,
+                    D, E, q, A0, A_minus, A_plus, G,
+                    l_bounds, u_bounds, c0, c_dyn,
+                    slack_weight_init, cfg.use_slack,
+                    T_blocks, n, nx, n0, m);
+            }
+            if (termination_check_fires || infeasibility_check_fires) {
                 checkConvergenceSignalKernel<T><<<1, 1, 0, stream>>>(
-                    d_residuals, entry->d_converged_flag, eps_abs_k, eps_rel_k, Nb, it + 1);
+                    d_residuals, d_infeasibility_metrics, d_finite_flags,
+                    status_out, d_iter_counts, terminal_residuals_out,
+                    entry->d_converged_flag, eps_abs_k, eps_rel_k,
+                    eps_prim_inf_k, eps_dual_inf_k,
+                    Nb, it + 1, termination_check_fires,
+                    infeasibility_check_fires, it + 1 == cfg.max_iter);
                 cudaStreamSynchronize(stream);
                 if (*entry->h_converged_flag >= 0) {
-                    actual_iters = *entry->h_converged_flag;
                     break;
                 }
             }
 
-            // Step 2: not converged → run rho-update (mutates d_rho_bar_work
-            // and may trigger refactor). Only reaches here if convergence
-            // didn't fire OR convergence fired but didn't satisfy.
+            // Update rho after any requested convergence check has completed.
+            // This may mutate d_rho_bar_work and trigger refactorization.
             if (rho_check_fires) {
                 // Reset the rho-changed flag, launch the per-batch update.
                 *entry->h_rho_changed_flag = 0;
@@ -1128,7 +1386,7 @@ static void launchADMMCudss(
                 int rho_blocks  = (Nb + rho_threads - 1) / rho_threads;
                 rhoUpdateKernel<T><<<rho_blocks, rho_threads, 0, stream>>>(
                     d_residuals, d_rho_bar_work, entry->d_rho_changed_flag,
-                    rho_min_k, rho_max_k, rho_tol_k, Nb);
+                    rho_factor_k, rho_min_k, rho_max_k, rho_tol_k, Nb, status_out);
                 cudaStreamSynchronize(stream);
             }
 
@@ -1171,17 +1429,10 @@ static void launchADMMCudss(
         }
     }
 
-    // Set final iteration counts
-    {
-        std::vector<uint32_t> h_iters(Nb, (uint32_t)actual_iters);
-        cudaMemcpyAsync(d_iter_counts, h_iters.data(), Nb * sizeof(uint32_t),
-                        cudaMemcpyHostToDevice, stream);
-    }
-
     // ---- Copy outputs ----
-    // rho_bar_out reads from d_rho_bar_work so callers see the post-adapt rho.
+    // rho_bar_out matches each row's final ADMM iterate.
     copyOutputsKernel<T><<<Nb, threads, 0, stream>>>(
-        x_out, iters_out, x_blocks_out, z_g_out, y_g_out,
+        iters_out, x_blocks_out, z_g_out, y_g_out,
         y_f_0_out, y_f_dyn_out, xi_g_out, rho_bar_out,
         d_x, d_z_g, d_y_g, d_y_f_0, d_y_f_dyn, d_xi_g,
         d_rho_bar_work, d_iter_counts,
@@ -1196,16 +1447,19 @@ static void launchADMMCudss(
         cudaMemcpyAsync(kernel_ns_out, h_ns.data(), Nb * sizeof(T),
                         cudaMemcpyHostToDevice, stream);
     }
+    CUDA_CHECK_THROW(cudaEventRecord(entry->completion_event, stream));
 }
 
 // ---- Explicit instantiations ----
 
 void LaunchADMMCudssF32(
+    turbompc::FfiDeviceAllocator& allocator,
+    uint64_t workspace_handle,
     cudaStream_t stream,
-    float* x_out, uint32_t* iters_out,
+    uint32_t* iters_out,
     float* x_blocks_out, float* z_g_out, float* y_g_out,
     float* y_f_0_out, float* y_f_dyn_out, float* xi_g_out, float* rho_bar_out,
-    float* kernel_ns_out,
+    float* kernel_ns_out, uint32_t* status_out, float* terminal_residuals_out,
     const float* S, const float* D, const float* E, const float* q,
     const float* A0, const float* A_minus, const float* A_plus, const float* G,
     const float* l_bounds, const float* u_bounds, const float* c0, const float* c_dyn,
@@ -1216,23 +1470,22 @@ void LaunchADMMCudssF32(
     int32_t T, int32_t n, int32_t nx, int32_t n0, int32_t m, int32_t Nb,
     ADMMCudssConfig cfg)
 {
-    launchADMMCudss<float>(stream,
-        x_out, iters_out,
-        x_blocks_out, z_g_out, y_g_out, y_f_0_out, y_f_dyn_out, xi_g_out, rho_bar_out,
-        kernel_ns_out,
-        S, D, E, q,
-        A0, A_minus, A_plus, G, l_bounds, u_bounds, c0, c_dyn,
-        x0, z_g0, y_g0, y_f_0_init, y_f_dyn_init, xi_g0, rho_bar_init,
-        slack_weight_init,
-        T, n, nx, n0, m, Nb, cfg);
+  launchADMMCudss<float>(
+      allocator, workspace_handle, stream, iters_out, x_blocks_out, z_g_out, y_g_out,
+      y_f_0_out, y_f_dyn_out, xi_g_out, rho_bar_out, kernel_ns_out, status_out,
+      terminal_residuals_out, S, D, E, q, A0, A_minus, A_plus, G, l_bounds,
+      u_bounds, c0, c_dyn, x0, z_g0, y_g0, y_f_0_init, y_f_dyn_init, xi_g0,
+      rho_bar_init, slack_weight_init, T, n, nx, n0, m, Nb, cfg);
 }
 
 void LaunchADMMCudssF64(
+    turbompc::FfiDeviceAllocator& allocator,
+    uint64_t workspace_handle,
     cudaStream_t stream,
-    double* x_out, uint32_t* iters_out,
+    uint32_t* iters_out,
     double* x_blocks_out, double* z_g_out, double* y_g_out,
     double* y_f_0_out, double* y_f_dyn_out, double* xi_g_out, double* rho_bar_out,
-    double* kernel_ns_out,
+    double* kernel_ns_out, uint32_t* status_out, double* terminal_residuals_out,
     const double* S, const double* D, const double* E, const double* q,
     const double* A0, const double* A_minus, const double* A_plus, const double* G,
     const double* l_bounds, const double* u_bounds, const double* c0, const double* c_dyn,
@@ -1243,10 +1496,10 @@ void LaunchADMMCudssF64(
     int32_t T, int32_t n, int32_t nx, int32_t n0, int32_t m, int32_t Nb,
     ADMMCudssConfig cfg)
 {
-    launchADMMCudss<double>(stream,
-        x_out, iters_out,
+    launchADMMCudss<double>(allocator, workspace_handle, stream,
+        iters_out,
         x_blocks_out, z_g_out, y_g_out, y_f_0_out, y_f_dyn_out, xi_g_out, rho_bar_out,
-        kernel_ns_out,
+        kernel_ns_out, status_out, terminal_residuals_out,
         S, D, E, q,
         A0, A_minus, A_plus, G, l_bounds, u_bounds, c0, c_dyn,
         x0, z_g0, y_g0, y_f_0_init, y_f_dyn_init, xi_g0, rho_bar_init,

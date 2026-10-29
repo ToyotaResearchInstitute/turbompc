@@ -11,6 +11,7 @@ class SchurSolverBackend(enum.IntEnum):
     PCG_FFI = 1
     CUDSS_FFI = 2
     JAX_DENSE = 3
+    EIGEN = 4
 
 
 class AdmmBackend(enum.IntEnum):
