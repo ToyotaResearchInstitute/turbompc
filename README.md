@@ -115,7 +115,7 @@ Many thanks to:
   author       = {Zhang, Jianghan and Schwan, Roland and Bravo-Palacios, Gabriel and Zhang, John and Lew, Thomas and Plancher, Brian},
   title        = {Efficient Learning of Differentiable {MPC} Policies on the {GPU} via Smoothed {ADMM} and First-Order Reinforcement Learning},
   year         = {2026},
-  note         = {Available at \url{https://arxiv.org/abs/2606.24039}}
+  note         = {Available on arXiv soon}
 }
 
 @unpublished{TurboMPC2026,
